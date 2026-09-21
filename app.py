@@ -17,6 +17,7 @@ from telegram.ext import (
 
 load_dotenv()
 
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -25,24 +26,43 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "").strip()
 
 DEXSCREENER_API = "https://api.dexscreener.com"
+
 SOLANA_RPC = os.getenv(
     "SOLANA_RPC",
     "https://api.mainnet-beta.solana.com"
 )
+
 SOLANA_WS = os.getenv(
     "SOLANA_WS",
     "wss://api.mainnet-beta.solana.com"
 )
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
-MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
-MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "5000"))
-ALERT_SCORE = int(os.getenv("ALERT_SCORE", "65"))
+SCAN_INTERVAL = int(
+    os.getenv("SCAN_INTERVAL", "30")
+)
 
-DB_FILE = os.getenv("DB_FILE", "scanner.db")
+MIN_LIQUIDITY_USD = float(
+    os.getenv("MIN_LIQUIDITY_USD", "5000")
+)
 
-# Pump.fun program
-PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78kV3Zqj3J5X1V9YvY8F"
+MIN_VOLUME_24H = float(
+    os.getenv("MIN_VOLUME_24H", "5000")
+)
+
+ALERT_SCORE = int(
+    os.getenv("ALERT_SCORE", "65")
+)
+
+DB_FILE = os.getenv(
+    "DB_FILE",
+    "scanner.db"
+)
+
+# Pump.fun Program
+PUMP_FUN_PROGRAM = (
+    "6EF8rrecthR5Dkzon8Nwu78kV3Zqj3J5X1V9YvY8F"
+)
+
 
 # ============================================================
 # GLOBALS
@@ -50,6 +70,7 @@ PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78kV3Zqj3J5X1V9YvY8F"
 
 http_session = None
 last_alerts = {}
+
 scan_task = None
 ws_task = None
 
@@ -67,7 +88,8 @@ def db_connect():
 def init_db():
     conn = db_connect()
 
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS paper_positions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chain TEXT NOT NULL,
@@ -80,9 +102,11 @@ def init_db():
             exit_price REAL,
             pnl_usd REAL
         )
-    """)
+        """
+    )
 
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chain TEXT,
@@ -93,7 +117,8 @@ def init_db():
             volume REAL,
             created_at TEXT
         )
-    """)
+        """
+    )
 
     conn.commit()
     conn.close()
@@ -149,28 +174,45 @@ def fmt_price(value):
 
 
 def token_key(pair):
-    return f"{pair.get('chainId')}:{pair.get('baseToken', {}).get('address')}"
+    return (
+        f"{pair.get('chainId')}:"
+        f"{pair.get('baseToken', {}).get('address')}"
+    )
 
 
 # ============================================================
-# DEXSCREENER
+# HTTP
 # ============================================================
 
-async def get_json(url, params=None):
+async def get_http_session():
     global http_session
 
     if http_session is None:
-        timeout = aiohttp.ClientTimeout(total=15)
-        http_session = aiohttp.ClientSession(timeout=timeout)
+        timeout = aiohttp.ClientTimeout(total=20)
+
+        http_session = aiohttp.ClientSession(
+            timeout=timeout
+        )
+
+    return http_session
+
+
+async def get_json(url, params=None):
+    session = await get_http_session()
 
     try:
-        async with http_session.get(
+        async with session.get(
             url,
             params=params,
-            headers={"Accept": "application/json"}
+            headers={
+                "Accept": "application/json"
+            }
         ) as response:
 
             if response.status != 200:
+                print(
+                    f"HTTP {response.status}: {url}"
+                )
                 return None
 
             return await response.json()
@@ -179,6 +221,10 @@ async def get_json(url, params=None):
         print(f"HTTP error: {exc}")
         return None
 
+
+# ============================================================
+# DEXSCREENER
+# ============================================================
 
 async def get_token_pairs(chain, address):
     data = await get_json(
@@ -191,7 +237,8 @@ async def get_token_pairs(chain, address):
     pairs = data.get("pairs") or []
 
     return [
-        pair for pair in pairs
+        pair
+        for pair in pairs
         if pair.get("chainId") == chain
     ]
 
@@ -232,7 +279,7 @@ def calculate_score(pair):
 
     score = 0
 
-    # Liquidity
+    # Liquidität
     if liquidity >= 100_000:
         score += 25
     elif liquidity >= 50_000:
@@ -242,7 +289,7 @@ def calculate_score(pair):
     elif liquidity >= MIN_LIQUIDITY_USD:
         score += 10
 
-    # Volume
+    # Volumen
     if volume >= 500_000:
         score += 25
     elif volume >= 100_000:
@@ -265,13 +312,13 @@ def calculate_score(pair):
         elif buy_ratio >= 0.50:
             score += 8
 
-    # Price momentum
+    # Momentum
     if 5 <= price_change <= 100:
         score += 10
     elif price_change > 100:
         score += 5
 
-    # Pair age
+    # Alter des Pairs
     created = pair.get("pairCreatedAt")
 
     if created:
@@ -328,7 +375,9 @@ def analyze_pair(pair):
         risks.append("Extremer Preisanstieg")
 
     if liquidity > 0 and volume / liquidity > 50:
-        risks.append("Sehr hohes Volumen/Liquidität-Verhältnis")
+        risks.append(
+            "Sehr hohes Volumen/Liquidität-Verhältnis"
+        )
 
     return {
         "score": score,
@@ -342,10 +391,12 @@ def analyze_pair(pair):
 
 
 # ============================================================
-# SOLANA SECURITY ANALYSIS
+# SOLANA RPC
 # ============================================================
 
 async def solana_rpc(method, params):
+    session = await get_http_session()
+
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -353,36 +404,39 @@ async def solana_rpc(method, params):
         "params": params,
     }
 
-    data = await get_json(
-        SOLANA_RPC,
-        params=None
-    )
-
-    # POST needs a separate request
-    global http_session
-
-    if http_session is None:
-        timeout = aiohttp.ClientTimeout(total=20)
-        http_session = aiohttp.ClientSession(timeout=timeout)
-
     try:
-        async with http_session.post(
+        async with session.post(
             SOLANA_RPC,
             json=payload,
-            headers={"Content-Type": "application/json"}
+            headers={
+                "Content-Type": "application/json"
+            }
         ) as response:
 
             if response.status != 200:
+                print(
+                    f"Solana RPC HTTP {response.status}"
+                )
                 return None
 
-            result = await response.json()
+            data = await response.json()
 
-            return result.get("result")
+            if "error" in data:
+                print(
+                    f"Solana RPC error: {data['error']}"
+                )
+                return None
+
+            return data.get("result")
 
     except Exception as exc:
         print(f"Solana RPC error: {exc}")
         return None
 
+
+# ============================================================
+# SOLANA SECURITY
+# ============================================================
 
 async def solana_risk_check(address):
     result = {
@@ -391,16 +445,6 @@ async def solana_risk_check(address):
         "top_holder_percent": None,
         "risks": [],
     }
-
-    supply_data = await solana_rpc(
-        "getTokenSupply",
-        [address]
-    )
-
-    if supply_data:
-        # Token supply exists, but authority information
-        # is obtained through parsed account information below.
-        pass
 
     largest = await solana_rpc(
         "getTokenLargestAccounts",
@@ -420,21 +464,34 @@ async def solana_risk_check(address):
 
             if total > 0:
                 amounts = [
-                    float(x.get("uiAmount") or 0)
-                    for x in largest.get("value", [])
+                    float(
+                        item.get("uiAmount") or 0
+                    )
+                    for item in largest.get(
+                        "value",
+                        []
+                    )
                 ]
 
                 if amounts:
-                    concentration = max(amounts) / total * 100
-                    result["top_holder_percent"] = concentration
+                    concentration = (
+                        max(amounts) / total * 100
+                    )
+
+                    result[
+                        "top_holder_percent"
+                    ] = concentration
 
                     if concentration >= 50:
                         result["risks"].append(
-                            f"Top Holder ca. {concentration:.1f}%"
+                            f"Top Holder ca. "
+                            f"{concentration:.1f}%"
                         )
+
                     elif concentration >= 25:
                         result["risks"].append(
-                            f"Hohe Holder-Konzentration: {concentration:.1f}%"
+                            f"Hohe Holder-Konzentration: "
+                            f"{concentration:.1f}%"
                         )
 
         except Exception:
@@ -459,12 +516,12 @@ async def solana_risk_check(address):
                 ["info"]
             )
 
-            result["mint_authority"] = parsed.get(
-                "mintAuthority"
+            result["mint_authority"] = (
+                parsed.get("mintAuthority")
             )
 
-            result["freeze_authority"] = parsed.get(
-                "freezeAuthority"
+            result["freeze_authority"] = (
+                parsed.get("freezeAuthority")
             )
 
             if result["mint_authority"]:
@@ -489,9 +546,12 @@ async def solana_risk_check(address):
 
 async def early_buyer_snapshot(address):
     """
-    Heuristische Analyse:
-    Liefert frühe Transaktionen rund um einen Token.
-    Dies ist KEIN vollständiger On-Chain-Buyer-Indexer.
+    Heuristische Analyse.
+
+    Diese Funktion liefert einen Snapshot von
+    Transaktionen rund um einen Token.
+
+    Sie ist KEIN vollständiger On-Chain-Buyer-Indexer.
     """
 
     result = {
@@ -512,7 +572,9 @@ async def early_buyer_snapshot(address):
     if not signatures:
         return result
 
-    result["early_transactions"] = len(signatures)
+    result["early_transactions"] = len(
+        signatures
+    )
 
     wallets = []
 
@@ -546,7 +608,10 @@ async def early_buyer_snapshot(address):
             for key in keys:
                 pubkey = key.get("pubkey")
 
-                if pubkey and pubkey not in wallets:
+                if (
+                    pubkey
+                    and pubkey not in wallets
+                ):
                     wallets.append(pubkey)
 
         except Exception:
@@ -566,47 +631,90 @@ async def send_message(application, text):
         print(text)
         return
 
+    if not ALLOWED_CHAT_ID:
+        print(
+            "ALLOWED_CHAT_ID fehlt. "
+            "Telegram-Nachricht nicht gesendet."
+        )
+        return
+
     try:
-        if ALLOWED_CHAT_ID:
-            await application.bot.send_message(
-                chat_id=ALLOWED_CHAT_ID,
-                text=text,
-                disable_web_page_preview=True
-            )
+        await application.bot.send_message(
+            chat_id=ALLOWED_CHAT_ID,
+            text=text,
+            disable_web_page_preview=True
+        )
 
     except Exception as exc:
-        print(f"Telegram error: {exc}")
+        print(
+            f"Telegram error: {exc}"
+        )
 
 
-def build_alert(pair, analysis, risk=None, early=None):
+def build_alert(
+    pair,
+    analysis,
+    risk=None,
+    early=None
+):
     base = pair.get("baseToken") or {}
 
-    symbol = base.get("symbol") or "UNKNOWN"
-    name = base.get("name") or symbol
-    address = base.get("address") or ""
+    symbol = (
+        base.get("symbol")
+        or "UNKNOWN"
+    )
 
-    chain = pair.get("chainId") or "unknown"
+    name = (
+        base.get("name")
+        or symbol
+    )
 
-    dex = pair.get("dexId") or "unknown"
+    address = (
+        base.get("address")
+        or ""
+    )
 
-    url = pair.get("url") or ""
+    chain = (
+        pair.get("chainId")
+        or "unknown"
+    )
+
+    dex = (
+        pair.get("dexId")
+        or "unknown"
+    )
+
+    url = (
+        pair.get("url")
+        or ""
+    )
 
     risks = []
 
     if analysis:
-        risks.extend(analysis.get("risks", []))
+        risks.extend(
+            analysis.get("risks", [])
+        )
 
     if risk:
-        risks.extend(risk.get("risks", []))
+        risks.extend(
+            risk.get("risks", [])
+        )
 
     if not risks:
-        risks.append("Keine offensichtlichen Scanner-Risiken")
+        risks.append(
+            "Keine offensichtlichen "
+            "Scanner-Risiken"
+        )
 
     early_wallet_count = 0
 
     if early:
         early_wallet_count = len(
-            early.get("early_wallets", [])
+            early.get(
+                "early_wallets",
+                []
+            )
         )
 
     return (
@@ -615,14 +723,21 @@ def build_alert(pair, analysis, risk=None, early=None):
         f"⛓️ Chain: {chain}\n"
         f"🏦 DEX: {dex}\n\n"
         f"⭐ Score: {analysis['score']}/100\n"
-        f"💧 Liquidität: {fmt_money(analysis['liquidity'])}\n"
-        f"📊 Volumen 24h: {fmt_money(analysis['volume'])}\n"
+        f"💧 Liquidität: "
+        f"{fmt_money(analysis['liquidity'])}\n"
+        f"📊 Volumen 24h: "
+        f"{fmt_money(analysis['volume'])}\n"
         f"🟢 Buys: {analysis['buys']}\n"
         f"🔴 Sells: {analysis['sells']}\n"
-        f"📈 Change 24h: {analysis['price_change']:.2f}%\n\n"
-        f"👛 Frühe Wallet-Snapshot: {early_wallet_count}\n\n"
+        f"📈 Change 24h: "
+        f"{analysis['price_change']:.2f}%\n\n"
+        f"👛 Frühe Wallet-Snapshot: "
+        f"{early_wallet_count}\n\n"
         "⚠️ Risiken:\n"
-        + "\n".join(f"• {risk}" for risk in risks)
+        + "\n".join(
+            f"• {item}"
+            for item in risks
+        )
         + "\n\n"
         f"📍 Token:\n{address}\n\n"
         f"🔗 DexScreener:\n{url}"
@@ -634,30 +749,42 @@ def build_alert(pair, analysis, risk=None, early=None):
 # ============================================================
 
 async def scan_profiles(application):
-    profiles = await get_latest_token_profiles()
+    profiles = (
+        await get_latest_token_profiles()
+    )
 
     if not profiles:
+        print(
+            "Keine aktuellen Token-Profile gefunden."
+        )
         return
 
-    for profile in profiles[:30]:
+    scanned = 0
+    alerts_sent = 0
 
+    for profile in profiles[:30]:
         chain = profile.get("chainId")
-        address = profile.get("tokenAddress")
+        address = profile.get(
+            "tokenAddress"
+        )
 
         if not chain or not address:
             continue
 
-        # DexScreener supports many chains.
-        # We query the token endpoint and choose the
-        # highest-liquidity pair on that chain.
-        pairs = await get_token_pairs(chain, address)
+        scanned += 1
+
+        pairs = await get_token_pairs(
+            chain,
+            address
+        )
 
         if not pairs:
             continue
 
         pairs.sort(
             key=lambda p: float(
-                (p.get("liquidity") or {}).get("usd") or 0
+                (p.get("liquidity") or {})
+                .get("usd") or 0
             ),
             reverse=True
         )
@@ -666,19 +793,30 @@ async def scan_profiles(application):
 
         analysis = analyze_pair(pair)
 
-        if analysis["liquidity"] < MIN_LIQUIDITY_USD:
+        if (
+            analysis["liquidity"]
+            < MIN_LIQUIDITY_USD
+        ):
             continue
 
-        if analysis["volume"] < MIN_VOLUME_24H:
+        if (
+            analysis["volume"]
+            < MIN_VOLUME_24H
+        ):
             continue
 
-        if analysis["score"] < ALERT_SCORE:
+        if (
+            analysis["score"]
+            < ALERT_SCORE
+        ):
             continue
 
         key = token_key(pair)
 
-        # Avoid repeated alerts
-        last = last_alerts.get(key, 0)
+        last = last_alerts.get(
+            key,
+            0
+        )
 
         if time.time() - last < 3600:
             continue
@@ -689,8 +827,13 @@ async def scan_profiles(application):
         early = None
 
         if chain == "solana":
-            risk = await solana_risk_check(address)
-            early = await early_buyer_snapshot(address)
+            risk = await solana_risk_check(
+                address
+            )
+
+            early = await early_buyer_snapshot(
+                address
+            )
 
         alert_text = build_alert(
             pair,
@@ -718,7 +861,12 @@ async def scan_profiles(application):
             (
                 chain,
                 address,
-                pair.get("baseToken", {}).get("symbol"),
+                pair.get(
+                    "baseToken",
+                    {}
+                ).get(
+                    "symbol"
+                ),
                 analysis["score"],
                 analysis["liquidity"],
                 analysis["volume"],
@@ -734,6 +882,14 @@ async def scan_profiles(application):
             alert_text
         )
 
+        alerts_sent += 1
+
+    print(
+        f"Scan abgeschlossen: "
+        f"{scanned} Tokens geprüft, "
+        f"{alerts_sent} Alerts."
+    )
+
 
 async def scanner_loop(application):
     print("Scanner gestartet.")
@@ -741,13 +897,20 @@ async def scanner_loop(application):
     while True:
         try:
             await scan_profiles(
-                context.application
+                application
             )
 
-        except Exception as exc:
-            print(f"Scanner error: {exc}")
+        except asyncio.CancelledError:
+            raise
 
-        await asyncio.sleep(SCAN_INTERVAL)
+        except Exception as exc:
+            print(
+                f"Scanner error: {exc}"
+            )
+
+        await asyncio.sleep(
+            SCAN_INTERVAL
+        )
 
 
 # ============================================================
@@ -755,7 +918,9 @@ async def scanner_loop(application):
 # ============================================================
 
 async def pumpfun_listener(application):
-    print("Pump.fun WebSocket wird gestartet...")
+    print(
+        "Pump.fun WebSocket wird gestartet..."
+    )
 
     while True:
         try:
@@ -785,11 +950,15 @@ async def pumpfun_listener(application):
                     json.dumps(subscription)
                 )
 
-                print("Pump.fun WebSocket verbunden.")
+                print(
+                    "Pump.fun WebSocket verbunden."
+                )
 
                 async for raw_message in websocket:
                     try:
-                        message = json.loads(raw_message)
+                        message = json.loads(
+                            raw_message
+                        )
 
                         value = (
                             message
@@ -798,30 +967,44 @@ async def pumpfun_listener(application):
                             .get("value", {})
                         )
 
-                        logs = value.get("logs", [])
+                        logs = value.get(
+                            "logs",
+                            []
+                        )
 
-                        joined = " ".join(logs).lower()
+                        joined = (
+                            " ".join(logs)
+                            .lower()
+                        )
 
                         if (
                             "createmint" in joined
-                            or "initialize_mint" in joined
-                            or "initialize" in joined
+                            or "initialize_mint"
+                            in joined
                         ):
-                            signature = value.get(
-                                "signature",
-                                "unknown"
+                            signature = (
+                                value.get(
+                                    "signature",
+                                    "unknown"
+                                )
                             )
 
                             print(
-                                "Mögliche neue Pump.fun-Aktivität:",
+                                "Mögliche Pump.fun "
+                                "Aktivität:",
                                 signature
                             )
 
                     except Exception:
                         continue
 
+        except asyncio.CancelledError:
+            raise
+
         except Exception as exc:
-            print(f"WebSocket error: {exc}")
+            print(
+                f"WebSocket error: {exc}"
+            )
 
             await asyncio.sleep(5)
 
@@ -842,7 +1025,8 @@ async def start_command(
         "/status – Bot-Status\n"
         "/scan – manuellen Scan starten\n"
         "/paper – Paper-Trading Übersicht\n"
-        "/buy <chain> <token> <usd> – Paper Buy"
+        "/buy <chain> <token> <usd> "
+        "– Paper Buy"
     )
 
 
@@ -874,11 +1058,10 @@ async def scan_command(
         "🔎 Manueller Scan gestartet..."
     )
 
-    try: await scan_profiles(
-    context.application) 
- 
-    
-    
+    try:
+        await scan_profiles(
+            context.application
+        )
 
         await update.message.reply_text(
             "✅ Scan abgeschlossen."
@@ -912,20 +1095,24 @@ async def paper_command(
 
     if not positions:
         await update.message.reply_text(
-            "🧪 Keine offenen Paper-Positionen."
+            "🧪 Keine offenen "
+            "Paper-Positionen."
         )
         return
 
     lines = [
-        "🧪 OFFENE PAPER-POSITIONEN\n"
+        "🧪 OFFENE "
+        "PAPER-POSITIONEN\n"
     ]
 
     for position in positions:
         lines.append(
             f"• {position['symbol']} "
             f"({position['chain']})\n"
-            f"  Einsatz: ${position['amount_usd']:.2f}\n"
-            f"  Entry: {fmt_price(position['entry_price'])}"
+            f"  Einsatz: "
+            f"${position['amount_usd']:.2f}\n"
+            f"  Entry: "
+            f"{fmt_price(position['entry_price'])}"
         )
 
     await update.message.reply_text(
@@ -956,6 +1143,7 @@ async def buy_command(
 
     try:
         amount = float(args[2])
+
     except ValueError:
         await update.message.reply_text(
             "❌ USD-Betrag ist ungültig."
@@ -981,7 +1169,8 @@ async def buy_command(
 
     pairs.sort(
         key=lambda p: float(
-            (p.get("liquidity") or {}).get("usd") or 0
+            (p.get("liquidity") or {})
+            .get("usd") or 0
         ),
         reverse=True
     )
@@ -998,12 +1187,9 @@ async def buy_command(
         )
         return
 
-    symbol = pair.get(
-        "baseToken",
-        {}
-    ).get(
-        "symbol",
-        "UNKNOWN"
+    symbol = (
+        pair.get("baseToken", {})
+        .get("symbol", "UNKNOWN")
     )
 
     conn = db_connect()
@@ -1064,7 +1250,34 @@ async def post_init(application):
 
 
 async def post_shutdown(application):
+    global scan_task
+    global ws_task
     global http_session
+
+    for task in (
+        scan_task,
+        ws_task
+    ):
+        if task:
+            task.cancel()
+
+    tasks = [
+        task
+        for task in (
+            scan_task,
+            ws_task
+        )
+        if task
+    ]
+
+    if tasks:
+        await asyncio.gather(
+            *tasks,
+            return_exceptions=True
+        )
+
+    scan_task = None
+    ws_task = None
 
     if http_session:
         await http_session.close()
@@ -1086,26 +1299,43 @@ def main():
     )
 
     application.add_handler(
-        CommandHandler("start", start_command)
+        CommandHandler(
+            "start",
+            start_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("status", status_command)
+        CommandHandler(
+            "status",
+            status_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("scan", scan_command)
+        CommandHandler(
+            "scan",
+            scan_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("paper", paper_command)
+        CommandHandler(
+            "paper",
+            paper_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("buy", buy_command)
+        CommandHandler(
+            "buy",
+            buy_command
+        )
     )
 
-    print("Memecoin Scanner wird gestartet...")
+    print(
+        "Memecoin Scanner wird gestartet..."
+    )
 
     application.run_polling()
 
