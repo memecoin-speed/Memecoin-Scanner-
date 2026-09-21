@@ -873,7 +873,7 @@ async def scan_command(
     )
 
     try: await scan_profiles(
-    context.application 
+    context.application) 
  
     
     
