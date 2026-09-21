@@ -58,7 +58,6 @@ DB_FILE = os.getenv(
     "scanner.db"
 )
 
-# Pump.fun Program
 PUMP_FUN_PROGRAM = (
     "6EF8rrecthR5Dkzon8Nwu78kV3Zqj3J5X1V9YvY8F"
 )
@@ -757,10 +756,16 @@ async def scan_profiles(application):
         print(
             "Keine aktuellen Token-Profile gefunden."
         )
-        return
+
+        return {
+            "scanned": 0,
+            "alerts_sent": 0,
+            "candidates": [],
+        }
 
     scanned = 0
     alerts_sent = 0
+    candidates = []
 
     for profile in profiles[:30]:
         chain = profile.get("chainId")
@@ -793,6 +798,23 @@ async def scan_profiles(application):
 
         analysis = analyze_pair(pair)
 
+        # Kandidat für die manuelle Scan-Ausgabe
+        # Nur Liquidität und Volumen müssen die
+        # Mindestwerte erfüllen.
+        if (
+            analysis["liquidity"]
+            >= MIN_LIQUIDITY_USD
+            and
+            analysis["volume"]
+            >= MIN_VOLUME_24H
+        ):
+            candidates.append({
+                "pair": pair,
+                "analysis": analysis,
+            })
+
+        # Für einen Alert müssen zusätzlich
+        # die Score-Anforderungen erfüllt sein.
         if (
             analysis["liquidity"]
             < MIN_LIQUIDITY_USD
@@ -884,11 +906,30 @@ async def scan_profiles(application):
 
         alerts_sent += 1
 
+    # Höchsten Score zuerst
+    candidates.sort(
+        key=lambda item: (
+            item["analysis"]["score"],
+            item["analysis"]["liquidity"],
+            item["analysis"]["volume"],
+        ),
+        reverse=True
+    )
+
+    result = {
+        "scanned": scanned,
+        "alerts_sent": alerts_sent,
+        "candidates": candidates[:5],
+    }
+
     print(
         f"Scan abgeschlossen: "
         f"{scanned} Tokens geprüft, "
-        f"{alerts_sent} Alerts."
+        f"{alerts_sent} Alerts, "
+        f"{len(candidates)} Kandidaten."
     )
+
+    return result
 
 
 async def scanner_loop(application):
@@ -1059,13 +1100,146 @@ async def scan_command(
     )
 
     try:
-        await scan_profiles(
+        result = await scan_profiles(
             context.application
         )
 
-        await update.message.reply_text(
-            "✅ Scan abgeschlossen."
+        message = (
+            "✅ Scan abgeschlossen.\n\n"
+            f"🔎 Geprüft: "
+            f"{result['scanned']}\n"
+            f"🚨 Alerts: "
+            f"{result['alerts_sent']}\n"
         )
+
+        candidates = result.get(
+            "candidates",
+            []
+        )
+
+        if candidates:
+            message += (
+                "\n🏆 TOP-KANDIDATEN:\n"
+            )
+
+            for i, candidate in enumerate(
+                candidates,
+                1
+            ):
+                pair = candidate["pair"]
+                analysis = candidate[
+                    "analysis"
+                ]
+
+                base = pair.get(
+                    "baseToken"
+                ) or {}
+
+                name = (
+                    base.get("name")
+                    or "Unknown"
+                )
+
+                symbol = (
+                    base.get("symbol")
+                    or "?"
+                )
+
+                liquidity = analysis.get(
+                    "liquidity",
+                    0
+                )
+
+                volume = analysis.get(
+                    "volume",
+                    0
+                )
+
+                score = analysis.get(
+                    "score",
+                    0
+                )
+
+                buys = analysis.get(
+                    "buys",
+                    0
+                )
+
+                sells = analysis.get(
+                    "sells",
+                    0
+                )
+
+                change = analysis.get(
+                    "price_change",
+                    0
+                )
+
+                risks = analysis.get(
+                    "risks",
+                    []
+                )
+
+                message += (
+                    f"\n{i}. "
+                    f"{name} ({symbol})\n"
+                    f"   ⛓️ Chain: "
+                    f"{pair.get('chainId', '?')}\n"
+                    f"   ⭐ Score: "
+                    f"{score}/100\n"
+                    f"   💧 Liquidität: "
+                    f"{fmt_money(liquidity)}\n"
+                    f"   📊 Volumen 24h: "
+                    f"{fmt_money(volume)}\n"
+                    f"   🟢 Käufe: "
+                    f"{buys} | "
+                    f"🔴 Verkäufe: "
+                    f"{sells}\n"
+                    f"   📈 24h: "
+                    f"{change:.2f}%\n"
+                )
+
+                if risks:
+                    message += (
+                        "   ⚠️ Risiken: "
+                        + ", ".join(risks)
+                        + "\n"
+                    )
+                else:
+                    message += (
+                        "   ⚠️ Risiken: "
+                        "Keine offensichtlichen\n"
+                    )
+
+                url = pair.get("url")
+
+                if url:
+                    message += (
+                        f"   🔗 {url}\n"
+                    )
+
+        else:
+            message += (
+                "\n❌ Keine passenden "
+                "Kandidaten gefunden."
+            )
+
+        # Telegram-Nachrichten haben eine maximale
+        # Nachrichtenlänge. Deshalb wird die Ausgabe
+        # bei Bedarf aufgeteilt.
+        max_length = 4000
+
+        for start in range(
+            0,
+            len(message),
+            max_length
+        ):
+            await update.message.reply_text(
+                message[
+                    start:start + max_length
+                ],
+                disable_web_page_preview=True
+            )
 
     except Exception as exc:
         await update.message.reply_text(
