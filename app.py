@@ -1,529 +1,1111 @@
 import os
-import asyncio
 import json
 import time
+import sqlite3
+import asyncio
+from datetime import datetime, timezone
 
 import aiohttp
 import websockets
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
 load_dotenv()
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("ALLOWED_CHAT_ID")
+# ============================================================
+# CONFIG
+# ============================================================
 
-SOLANA_HTTP = os.getenv(
-    "SOLANA_HTTP_URL",
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "").strip()
+
+DEXSCREENER_API = "https://api.dexscreener.com"
+SOLANA_RPC = os.getenv(
+    "SOLANA_RPC",
     "https://api.mainnet-beta.solana.com"
 )
-
 SOLANA_WS = os.getenv(
-    "SOLANA_WS_URL",
+    "SOLANA_WS",
     "wss://api.mainnet-beta.solana.com"
 )
 
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
-MIN_VOLUME = float(os.getenv("MIN_VOLUME_5M_USD", "1000"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "55"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "30"))
+MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
+MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "5000"))
+ALERT_SCORE = int(os.getenv("ALERT_SCORE", "65"))
 
-# Pump.fun Programm
-PUMP_PROGRAM = os.getenv(
-    "PUMP_PROGRAM_ID",
-    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-)
+DB_FILE = os.getenv("DB_FILE", "scanner.db")
 
-seen_tokens = set()
-last_alert = {}
+# Pump.fun program
+PUMP_FUN_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78kV3Zqj3J5X1V9YvY8F"
 
+# ============================================================
+# GLOBALS
+# ============================================================
 
-async def rpc(method, params):
-    payload = {
-        "jsonrpc": "2.0",
-        "id": int(time.time() * 1000),
-        "method": method,
-        "params": params,
-    }
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            SOLANA_HTTP,
-            json=payload,
-            timeout=15
-        ) as response:
-            return await response.json()
+http_session = None
+last_alerts = {}
+scan_task = None
+ws_task = None
 
 
-async def dex_data(token):
-    url = (
-        "https://api.dexscreener.com"
-        "/latest/dex/tokens/"
-        + token
-    )
+# ============================================================
+# DATABASE
+# ============================================================
+
+def db_connect():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = db_connect()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS paper_positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain TEXT NOT NULL,
+            token_address TEXT NOT NULL,
+            symbol TEXT,
+            entry_price REAL NOT NULL,
+            amount_usd REAL NOT NULL,
+            opened_at TEXT NOT NULL,
+            closed_at TEXT,
+            exit_price REAL,
+            pnl_usd REAL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chain TEXT,
+            token_address TEXT,
+            symbol TEXT,
+            score INTEGER,
+            liquidity REAL,
+            volume REAL,
+            created_at TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def allowed(update: Update):
+    if not ALLOWED_CHAT_ID:
+        return True
+
+    chat = update.effective_chat
+
+    if not chat:
+        return False
+
+    return str(chat.id) == ALLOWED_CHAT_ID
+
+
+def fmt_money(value):
+    if value is None:
+        return "n/a"
+
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.2f}M"
+
+    if value >= 1_000:
+        return f"${value / 1_000:.1f}K"
+
+    return f"${value:.2f}"
+
+
+def fmt_price(value):
+    if value is None:
+        return "n/a"
+
+    if value == 0:
+        return "0"
+
+    if value < 0.000001:
+        return f"{value:.10f}"
+
+    if value < 0.01:
+        return f"{value:.8f}"
+
+    return f"{value:.6f}"
+
+
+def token_key(pair):
+    return f"{pair.get('chainId')}:{pair.get('baseToken', {}).get('address')}"
+
+
+# ============================================================
+# DEXSCREENER
+# ============================================================
+
+async def get_json(url, params=None):
+    global http_session
+
+    if http_session is None:
+        timeout = aiohttp.ClientTimeout(total=15)
+        http_session = aiohttp.ClientSession(timeout=timeout)
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url,
-                timeout=10
-            ) as response:
+        async with http_session.get(
+            url,
+            params=params,
+            headers={"Accept": "application/json"}
+        ) as response:
 
-                if response.status != 200:
-                    return None
+            if response.status != 200:
+                return None
 
-                data = await response.json()
+            return await response.json()
 
-        pairs = data.get("pairs") or []
-
-        sol_pairs = [
-            p for p in pairs
-            if p.get("chainId") == "solana"
-        ]
-
-        if not sol_pairs:
-            return None
-
-        return max(
-            sol_pairs,
-            key=lambda p: float(
-                (p.get("liquidity") or {}).get("usd") or 0
-            )
-        )
-
-    except Exception as e:
-        print("DexScreener Fehler:", e)
+    except Exception as exc:
+        print(f"HTTP error: {exc}")
         return None
 
 
-def calculate_score(pair):
+async def get_token_pairs(chain, address):
+    data = await get_json(
+        f"{DEXSCREENER_API}/latest/dex/tokens/{address}"
+    )
 
+    if not data:
+        return []
+
+    pairs = data.get("pairs") or []
+
+    return [
+        pair for pair in pairs
+        if pair.get("chainId") == chain
+    ]
+
+
+async def get_latest_token_profiles():
+    data = await get_json(
+        f"{DEXSCREENER_API}/token-profiles/latest/v1"
+    )
+
+    if not isinstance(data, list):
+        return []
+
+    return data
+
+
+# ============================================================
+# ANALYSIS
+# ============================================================
+
+def calculate_score(pair):
     liquidity = float(
         (pair.get("liquidity") or {}).get("usd") or 0
     )
 
-    volume5m = float(
-        (pair.get("volume") or {}).get("m5") or 0
+    volume = float(
+        (pair.get("volume") or {}).get("h24") or 0
     )
 
-    buys = int(
-        (pair.get("txns") or {}).get("m5", {}).get("buys") or 0
-    )
+    txns = pair.get("txns") or {}
+    h24 = txns.get("h24") or {}
 
-    sells = int(
-        (pair.get("txns") or {}).get("m5", {}).get("sells") or 0
+    buys = int(h24.get("buys") or 0)
+    sells = int(h24.get("sells") or 0)
+
+    price_change = float(
+        (pair.get("priceChange") or {}).get("h24") or 0
     )
 
     score = 0
-    reasons = []
 
-    if liquidity >= 25000:
+    # Liquidity
+    if liquidity >= 100_000:
         score += 25
-        reasons.append("💧 hohe Liquidität")
-    elif liquidity >= MIN_LIQUIDITY:
-        score += 15
-        reasons.append("💧 ausreichende Liquidität")
-    else:
-        reasons.append("⚠️ geringe Liquidität")
-
-    if volume5m >= 10000:
+    elif liquidity >= 50_000:
         score += 20
-        reasons.append("📈 hohes 5m Volumen")
-    elif volume5m >= MIN_VOLUME:
+    elif liquidity >= 20_000:
+        score += 15
+    elif liquidity >= MIN_LIQUIDITY_USD:
         score += 10
-        reasons.append("📈 Volumen vorhanden")
-    else:
-        reasons.append("⚠️ geringes Volumen")
 
-    total = buys + sells
+    # Volume
+    if volume >= 500_000:
+        score += 25
+    elif volume >= 100_000:
+        score += 20
+    elif volume >= 25_000:
+        score += 15
+    elif volume >= MIN_VOLUME_24H:
+        score += 10
 
-    if total >= 10:
-        buy_ratio = buys / total
+    # Buy pressure
+    total_txns = buys + sells
 
-        if buy_ratio >= 0.60:
+    if total_txns > 0:
+        buy_ratio = buys / total_txns
+
+        if buy_ratio >= 0.70:
             score += 20
-            reasons.append("🟢 Käufer dominieren")
+        elif buy_ratio >= 0.60:
+            score += 15
         elif buy_ratio >= 0.50:
-            score += 10
-            reasons.append("🟡 leicht mehr Käufe")
-        else:
-            reasons.append("🔴 Verkäufer dominieren")
-    else:
-        reasons.append("⚠️ wenige Trades")
+            score += 8
 
-    age = 0
+    # Price momentum
+    if 5 <= price_change <= 100:
+        score += 10
+    elif price_change > 100:
+        score += 5
+
+    # Pair age
+    created = pair.get("pairCreatedAt")
+
+    if created:
+        age_minutes = max(
+            0,
+            (time.time() * 1000 - created) / 60_000
+        )
+
+        if age_minutes <= 10:
+            score += 20
+        elif age_minutes <= 30:
+            score += 15
+        elif age_minutes <= 60:
+            score += 10
+        elif age_minutes <= 180:
+            score += 5
+
+    return min(score, 100)
+
+
+def analyze_pair(pair):
+    liquidity = float(
+        (pair.get("liquidity") or {}).get("usd") or 0
+    )
+
+    volume = float(
+        (pair.get("volume") or {}).get("h24") or 0
+    )
+
+    txns = pair.get("txns") or {}
+    h24 = txns.get("h24") or {}
+
+    buys = int(h24.get("buys") or 0)
+    sells = int(h24.get("sells") or 0)
+
+    price_change = float(
+        (pair.get("priceChange") or {}).get("h24") or 0
+    )
+
+    score = calculate_score(pair)
+
+    risks = []
+
+    if liquidity < MIN_LIQUIDITY_USD:
+        risks.append("Niedrige Liquidität")
+
+    if volume < MIN_VOLUME_24H:
+        risks.append("Niedriges Volumen")
+
+    if sells > buys * 1.5 and sells > 20:
+        risks.append("Starker Verkaufsdruck")
+
+    if price_change > 200:
+        risks.append("Extremer Preisanstieg")
+
+    if liquidity > 0 and volume / liquidity > 50:
+        risks.append("Sehr hohes Volumen/Liquidität-Verhältnis")
+
+    return {
+        "score": score,
+        "liquidity": liquidity,
+        "volume": volume,
+        "buys": buys,
+        "sells": sells,
+        "price_change": price_change,
+        "risks": risks,
+    }
+
+
+# ============================================================
+# SOLANA SECURITY ANALYSIS
+# ============================================================
+
+async def solana_rpc(method, params):
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    }
+
+    data = await get_json(
+        SOLANA_RPC,
+        params=None
+    )
+
+    # POST needs a separate request
+    global http_session
+
+    if http_session is None:
+        timeout = aiohttp.ClientTimeout(total=20)
+        http_session = aiohttp.ClientSession(timeout=timeout)
 
     try:
-        created = pair.get("pairCreatedAt")
+        async with http_session.post(
+            SOLANA_RPC,
+            json=payload,
+            headers={"Content-Type": "application/json"}
+        ) as response:
 
-        if created:
-            age = max(
-                0,
-                int(time.time() - created / 1000)
-            )
+            if response.status != 200:
+                return None
 
-            if age <= 300:
-                score += 20
-                reasons.append("⚡ sehr jung")
+            result = await response.json()
 
-            elif age <= 1200:
-                score += 10
-                reasons.append("⏱️ jung")
+            return result.get("result")
 
-    except Exception:
+    except Exception as exc:
+        print(f"Solana RPC error: {exc}")
+        return None
+
+
+async def solana_risk_check(address):
+    result = {
+        "mint_authority": None,
+        "freeze_authority": None,
+        "top_holder_percent": None,
+        "risks": [],
+    }
+
+    supply_data = await solana_rpc(
+        "getTokenSupply",
+        [address]
+    )
+
+    if supply_data:
+        # Token supply exists, but authority information
+        # is obtained through parsed account information below.
         pass
 
-    return min(score, 100), reasons, liquidity, volume5m, buys, sells, age
-
-
-async def send_alert(
-    application,
-    token,
-    pair,
-    score,
-    reasons,
-    liquidity,
-    volume5m,
-    buys,
-    sells,
-    age
-):
-
-    if not CHAT_ID:
-        print("ALLOWED_CHAT_ID fehlt.")
-        return
-
-    now = time.time()
-
-    if token in last_alert:
-        if now - last_alert[token] < 60:
-            return
-
-    last_alert[token] = now
-
-    symbol = pair.get("baseToken", {}).get(
-        "symbol",
-        "UNKNOWN"
+    largest = await solana_rpc(
+        "getTokenLargestAccounts",
+        [address]
     )
 
-    name = pair.get("baseToken", {}).get(
-        "name",
-        "Unknown"
+    supply = await solana_rpc(
+        "getTokenSupply",
+        [address]
     )
 
-    dex = pair.get("dexId", "unknown")
+    if largest and supply:
+        try:
+            total = float(
+                supply["value"]["uiAmount"] or 0
+            )
 
-    chart = (
-        "https://dexscreener.com/solana/"
-        + token
+            if total > 0:
+                amounts = [
+                    float(x.get("uiAmount") or 0)
+                    for x in largest.get("value", [])
+                ]
+
+                if amounts:
+                    concentration = max(amounts) / total * 100
+                    result["top_holder_percent"] = concentration
+
+                    if concentration >= 50:
+                        result["risks"].append(
+                            f"Top Holder ca. {concentration:.1f}%"
+                        )
+                    elif concentration >= 25:
+                        result["risks"].append(
+                            f"Hohe Holder-Konzentration: {concentration:.1f}%"
+                        )
+
+        except Exception:
+            pass
+
+    account_info = await solana_rpc(
+        "getAccountInfo",
+        [
+            address,
+            {
+                "encoding": "jsonParsed"
+            }
+        ]
     )
 
-    age_text = (
-        f"{age // 60}m {age % 60}s"
-        if age
-        else "unbekannt"
+    if account_info:
+        try:
+            parsed = (
+                account_info["value"]
+                ["data"]
+                ["parsed"]
+                ["info"]
+            )
+
+            result["mint_authority"] = parsed.get(
+                "mintAuthority"
+            )
+
+            result["freeze_authority"] = parsed.get(
+                "freezeAuthority"
+            )
+
+            if result["mint_authority"]:
+                result["risks"].append(
+                    "Mint Authority aktiv"
+                )
+
+            if result["freeze_authority"]:
+                result["risks"].append(
+                    "Freeze Authority aktiv"
+                )
+
+        except Exception:
+            pass
+
+    return result
+
+
+# ============================================================
+# EARLY BUYER HEURISTIC
+# ============================================================
+
+async def early_buyer_snapshot(address):
+    """
+    Heuristische Analyse:
+    Liefert frühe Transaktionen rund um einen Token.
+    Dies ist KEIN vollständiger On-Chain-Buyer-Indexer.
+    """
+
+    result = {
+        "early_transactions": 0,
+        "early_wallets": [],
+    }
+
+    signatures = await solana_rpc(
+        "getSignaturesForAddress",
+        [
+            address,
+            {
+                "limit": 25
+            }
+        ]
     )
 
-    text = (
-        "🚨 *NEW MEMECOIN SIGNAL*\n\n"
-        f"🪙 *{name}* ({symbol})\n"
-        f"📍 `{token}`\n\n"
-        f"⏱ Alter: {age_text}\n"
-        f"💧 Liquidität: ${liquidity:,.0f}\n"
-        f"📈 5m Volumen: ${volume5m:,.0f}\n"
-        f"🟢 Buys: {buys}\n"
-        f"🔴 Sells: {sells}\n"
-        f"🏪 DEX: {dex}\n\n"
-        f"⭐ *Score: {score}/100*\n\n"
-        + "\n".join(reasons)
-        + f"\n\n📊 [Chart öffnen]({chart})"
-    )
+    if not signatures:
+        return result
 
-    await application.bot.send_message(
-        chat_id=CHAT_ID,
-        text=text,
-        parse_mode="Markdown",
-        disable_web_page_preview=False,
-    )
+    result["early_transactions"] = len(signatures)
 
+    wallets = []
 
-def extract_tokens(logs):
+    for signature in signatures[:10]:
+        sig = signature.get("signature")
 
-    tokens = []
+        if not sig:
+            continue
 
-    for log in logs:
-
-        if "InitializeMint" in log:
-            parts = log.split()
-
-            for part in parts:
-                if len(part) >= 32 and len(part) <= 44:
-                    tokens.append(part)
-
-    return list(set(tokens))
-
-
-async def inspect_transaction(application, signature):
-
-    try:
-
-        result = await rpc(
+        tx = await solana_rpc(
             "getTransaction",
             [
-                signature,
+                sig,
                 {
                     "encoding": "jsonParsed",
-                    "commitment": "processed",
                     "maxSupportedTransactionVersion": 0
                 }
             ]
         )
 
-        tx = result.get("result")
-
         if not tx:
-            return
-
-        message = (
-            tx.get("transaction", {})
-            .get("message", {})
-        )
-
-        instructions = message.get(
-            "instructions",
-            []
-        )
-
-        for instruction in instructions:
-
-            parsed = instruction.get("parsed")
-
-            if not parsed:
-                continue
-
-            if parsed.get("type") not in (
-                "initializeMint",
-                "initializeMint2"
-            ):
-                continue
-
-            info = parsed.get("info", {})
-            token = info.get("mint")
-
-            if not token:
-                continue
-
-            if token in seen_tokens:
-                continue
-
-            seen_tokens.add(token)
-
-            print("Neuer Token:", token)
-
-            pair = await dex_data(token)
-
-            if not pair:
-                continue
-
-            (
-                score,
-                reasons,
-                liquidity,
-                volume5m,
-                buys,
-                sells,
-                age
-            ) = calculate_score(pair)
-
-            print(
-                token,
-                "Score:",
-                score
-            )
-
-            if (
-                score >= MIN_SCORE
-                and liquidity >= MIN_LIQUIDITY
-                and volume5m >= MIN_VOLUME
-            ):
-
-                await send_alert(
-                    application,
-                    token,
-                    pair,
-                    score,
-                    reasons,
-                    liquidity,
-                    volume5m,
-                    buys,
-                    sells,
-                    age
-                )
-
-    except Exception as e:
-
-        print(
-            "Transaction Fehler:",
-            e
-        )
-
-
-async def solana_scanner(application):
-
-    while True:
+            continue
 
         try:
-
-            print(
-                "🔌 Verbinde mit Solana WebSocket..."
+            keys = (
+                tx["transaction"]
+                ["message"]
+                ["accountKeys"]
             )
 
+            for key in keys:
+                pubkey = key.get("pubkey")
+
+                if pubkey and pubkey not in wallets:
+                    wallets.append(pubkey)
+
+        except Exception:
+            continue
+
+    result["early_wallets"] = wallets[:10]
+
+    return result
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+async def send_message(application, text):
+    if not TELEGRAM_BOT_TOKEN:
+        print(text)
+        return
+
+    try:
+        if ALLOWED_CHAT_ID:
+            await application.bot.send_message(
+                chat_id=ALLOWED_CHAT_ID,
+                text=text,
+                disable_web_page_preview=True
+            )
+
+    except Exception as exc:
+        print(f"Telegram error: {exc}")
+
+
+def build_alert(pair, analysis, risk=None, early=None):
+    base = pair.get("baseToken") or {}
+
+    symbol = base.get("symbol") or "UNKNOWN"
+    name = base.get("name") or symbol
+    address = base.get("address") or ""
+
+    chain = pair.get("chainId") or "unknown"
+
+    dex = pair.get("dexId") or "unknown"
+
+    url = pair.get("url") or ""
+
+    risks = []
+
+    if analysis:
+        risks.extend(analysis.get("risks", []))
+
+    if risk:
+        risks.extend(risk.get("risks", []))
+
+    if not risks:
+        risks.append("Keine offensichtlichen Scanner-Risiken")
+
+    early_wallet_count = 0
+
+    if early:
+        early_wallet_count = len(
+            early.get("early_wallets", [])
+        )
+
+    return (
+        "🚨 MEMECOIN ALERT\n\n"
+        f"🪙 {name} ({symbol})\n"
+        f"⛓️ Chain: {chain}\n"
+        f"🏦 DEX: {dex}\n\n"
+        f"⭐ Score: {analysis['score']}/100\n"
+        f"💧 Liquidität: {fmt_money(analysis['liquidity'])}\n"
+        f"📊 Volumen 24h: {fmt_money(analysis['volume'])}\n"
+        f"🟢 Buys: {analysis['buys']}\n"
+        f"🔴 Sells: {analysis['sells']}\n"
+        f"📈 Change 24h: {analysis['price_change']:.2f}%\n\n"
+        f"👛 Frühe Wallet-Snapshot: {early_wallet_count}\n\n"
+        "⚠️ Risiken:\n"
+        + "\n".join(f"• {risk}" for risk in risks)
+        + "\n\n"
+        f"📍 Token:\n{address}\n\n"
+        f"🔗 DexScreener:\n{url}"
+    )
+
+
+# ============================================================
+# TOKEN SCANNER
+# ============================================================
+
+async def scan_profiles(application):
+    profiles = await get_latest_token_profiles()
+
+    if not profiles:
+        return
+
+    for profile in profiles[:30]:
+
+        chain = profile.get("chainId")
+        address = profile.get("tokenAddress")
+
+        if not chain or not address:
+            continue
+
+        # DexScreener supports many chains.
+        # We query the token endpoint and choose the
+        # highest-liquidity pair on that chain.
+        pairs = await get_token_pairs(chain, address)
+
+        if not pairs:
+            continue
+
+        pairs.sort(
+            key=lambda p: float(
+                (p.get("liquidity") or {}).get("usd") or 0
+            ),
+            reverse=True
+        )
+
+        pair = pairs[0]
+
+        analysis = analyze_pair(pair)
+
+        if analysis["liquidity"] < MIN_LIQUIDITY_USD:
+            continue
+
+        if analysis["volume"] < MIN_VOLUME_24H:
+            continue
+
+        if analysis["score"] < ALERT_SCORE:
+            continue
+
+        key = token_key(pair)
+
+        # Avoid repeated alerts
+        last = last_alerts.get(key, 0)
+
+        if time.time() - last < 3600:
+            continue
+
+        last_alerts[key] = time.time()
+
+        risk = None
+        early = None
+
+        if chain == "solana":
+            risk = await solana_risk_check(address)
+            early = await early_buyer_snapshot(address)
+
+        alert_text = build_alert(
+            pair,
+            analysis,
+            risk,
+            early
+        )
+
+        conn = db_connect()
+
+        conn.execute(
+            """
+            INSERT INTO alerts
+            (
+                chain,
+                token_address,
+                symbol,
+                score,
+                liquidity,
+                volume,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                chain,
+                address,
+                pair.get("baseToken", {}).get("symbol"),
+                analysis["score"],
+                analysis["liquidity"],
+                analysis["volume"],
+                now_iso(),
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+        await send_message(
+            application,
+            alert_text
+        )
+
+
+async def scanner_loop(application):
+    print("Scanner gestartet.")
+
+    while True:
+        try:
+            await scan_profiles(application)
+
+        except Exception as exc:
+            print(f"Scanner error: {exc}")
+
+        await asyncio.sleep(SCAN_INTERVAL)
+
+
+# ============================================================
+# PUMP.FUN WEBSOCKET
+# ============================================================
+
+async def pumpfun_listener(application):
+    print("Pump.fun WebSocket wird gestartet...")
+
+    while True:
+        try:
             async with websockets.connect(
                 SOLANA_WS,
                 ping_interval=20,
                 ping_timeout=20
-            ) as ws:
+            ) as websocket:
 
-                request = {
+                subscription = {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "logsSubscribe",
                     "params": [
                         {
                             "mentions": [
-                                PUMP_PROGRAM
+                                PUMP_FUN_PROGRAM
                             ]
                         },
                         {
-                            "commitment": "processed"
+                            "commitment": "confirmed"
                         }
                     ]
                 }
 
-                await ws.send(
-                    json.dumps(request)
+                await websocket.send(
+                    json.dumps(subscription)
                 )
 
-                print(
-                    "🟢 Solana Scanner verbunden"
-                )
+                print("Pump.fun WebSocket verbunden.")
 
-                async for message in ws:
+                async for raw_message in websocket:
+                    try:
+                        message = json.loads(raw_message)
 
-                    data = json.loads(message)
-
-                    if data.get("method") != "logsNotification":
-                        continue
-
-                    value = (
-                        data.get("params", {})
-                        .get("result", {})
-                        .get("value", {})
-                    )
-
-                    if value.get("err"):
-                        continue
-
-                    signature = value.get(
-                        "signature"
-                    )
-
-                    if signature:
-                        asyncio.create_task(
-                            inspect_transaction(
-                                application,
-                                signature
-                            )
+                        value = (
+                            message
+                            .get("params", {})
+                            .get("result", {})
+                            .get("value", {})
                         )
 
-        except Exception as e:
+                        logs = value.get("logs", [])
 
-            print(
-                "WebSocket Fehler:",
-                e
-            )
+                        joined = " ".join(logs).lower()
+
+                        if (
+                            "createmint" in joined
+                            or "initialize_mint" in joined
+                            or "initialize" in joined
+                        ):
+                            signature = value.get(
+                                "signature",
+                                "unknown"
+                            )
+
+                            print(
+                                "Mögliche neue Pump.fun-Aktivität:",
+                                signature
+                            )
+
+                    except Exception:
+                        continue
+
+        except Exception as exc:
+            print(f"WebSocket error: {exc}")
 
             await asyncio.sleep(5)
 
 
-async def start(update: Update, context):
+# ============================================================
+# TELEGRAM COMMANDS
+# ============================================================
 
-    chat_id = update.effective_chat.id
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not allowed(update):
+        return
 
     await update.message.reply_text(
-        "🤖 *Memecoin Early Scanner*\n\n"
-        "🟢 Telegram: ONLINE\n"
-        "🟢 Solana Scanner: AKTIV\n"
-        "🧪 Paper Trading: NOCH NICHT AKTIV\n\n"
-        f"🆔 Chat-ID: `{chat_id}`",
-        parse_mode="Markdown"
+        "🤖 Memecoin Scanner aktiv.\n\n"
+        "/status – Bot-Status\n"
+        "/scan – manuellen Scan starten\n"
+        "/paper – Paper-Trading Übersicht\n"
+        "/buy <chain> <token> <usd> – Paper Buy"
     )
 
 
-async def status(update: Update, context):
+async def status_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not allowed(update):
+        return
 
     await update.message.reply_text(
-        "🟢 Scanner läuft\n\n"
-        f"👀 Beobachtete Tokens: {len(seen_tokens)}\n"
-        f"💧 Mindest-Liquidität: ${MIN_LIQUIDITY:,.0f}\n"
-        f"📈 Mindest-5m-Volumen: ${MIN_VOLUME:,.0f}\n"
-        f"⭐ Mindest-Score: {MIN_SCORE}/100\n\n"
-        "🧪 Paper Trading: NOCH NICHT AKTIV"
+        "🟢 BOT STATUS\n\n"
+        "Scanner: aktiv\n"
+        "DexScreener: aktiv\n"
+        "Paper Trading: aktiv\n"
+        "Solana Analyse: aktiv\n"
+        "Pump.fun Listener: aktiv"
     )
 
 
-async def main():
+async def scan_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not allowed(update):
+        return
 
-    if not TOKEN:
+    await update.message.reply_text(
+        "🔎 Manueller Scan gestartet..."
+    )
+
+    try:
+        await scan_profiles(
+            update.get_bot().application
+        )
+
+        await update.message.reply_text(
+            "✅ Scan abgeschlossen."
+        )
+
+    except Exception as exc:
+        await update.message.reply_text(
+            f"❌ Scan-Fehler: {exc}"
+        )
+
+
+async def paper_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not allowed(update):
+        return
+
+    conn = db_connect()
+
+    positions = conn.execute(
+        """
+        SELECT *
+        FROM paper_positions
+        WHERE closed_at IS NULL
+        ORDER BY id DESC
+        """
+    ).fetchall()
+
+    conn.close()
+
+    if not positions:
+        await update.message.reply_text(
+            "🧪 Keine offenen Paper-Positionen."
+        )
+        return
+
+    lines = [
+        "🧪 OFFENE PAPER-POSITIONEN\n"
+    ]
+
+    for position in positions:
+        lines.append(
+            f"• {position['symbol']} "
+            f"({position['chain']})\n"
+            f"  Einsatz: ${position['amount_usd']:.2f}\n"
+            f"  Entry: {fmt_price(position['entry_price'])}"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+
+
+async def buy_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if not allowed(update):
+        return
+
+    args = context.args
+
+    if len(args) != 3:
+        await update.message.reply_text(
+            "Verwendung:\n"
+            "/buy <chain> <token> <usd>\n\n"
+            "Beispiel:\n"
+            "/buy solana TOKENADRESSE 10"
+        )
+        return
+
+    chain = args[0]
+    address = args[1]
+
+    try:
+        amount = float(args[2])
+    except ValueError:
+        await update.message.reply_text(
+            "❌ USD-Betrag ist ungültig."
+        )
+        return
+
+    if amount <= 0:
+        await update.message.reply_text(
+            "❌ Betrag muss größer als 0 sein."
+        )
+        return
+
+    pairs = await get_token_pairs(
+        chain,
+        address
+    )
+
+    if not pairs:
+        await update.message.reply_text(
+            "❌ Kein handelbares Pair gefunden."
+        )
+        return
+
+    pairs.sort(
+        key=lambda p: float(
+            (p.get("liquidity") or {}).get("usd") or 0
+        ),
+        reverse=True
+    )
+
+    pair = pairs[0]
+
+    price = float(
+        pair.get("priceUsd") or 0
+    )
+
+    if price <= 0:
+        await update.message.reply_text(
+            "❌ Kein gültiger Preis verfügbar."
+        )
+        return
+
+    symbol = pair.get(
+        "baseToken",
+        {}
+    ).get(
+        "symbol",
+        "UNKNOWN"
+    )
+
+    conn = db_connect()
+
+    conn.execute(
+        """
+        INSERT INTO paper_positions
+        (
+            chain,
+            token_address,
+            symbol,
+            entry_price,
+            amount_usd,
+            opened_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            chain,
+            address,
+            symbol,
+            price,
+            amount,
+            now_iso(),
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        "🧪 PAPER BUY\n\n"
+        f"Token: {symbol}\n"
+        f"Chain: {chain}\n"
+        f"Einsatz: ${amount:.2f}\n"
+        f"Entry: {fmt_price(price)}\n\n"
+        "⚠️ Kein echter Kauf."
+    )
+
+
+# ============================================================
+# APPLICATION
+# ============================================================
+
+async def post_init(application):
+    global scan_task
+    global ws_task
+
+    init_db()
+
+    scan_task = asyncio.create_task(
+        scanner_loop(application)
+    )
+
+    ws_task = asyncio.create_task(
+        pumpfun_listener(application)
+    )
+
+
+async def post_shutdown(application):
+    global http_session
+
+    if http_session:
+        await http_session.close()
+        http_session = None
+
+
+def main():
+    if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN fehlt."
         )
 
     application = (
-        Application
-        .builder()
-        .token(TOKEN)
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
     application.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
+        CommandHandler("start", start_command)
     )
 
     application.add_handler(
-        CommandHandler(
-            "status",
-            status
-        )
+        CommandHandler("status", status_command)
     )
 
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-
-    scanner = asyncio.create_task(
-        solana_scanner(application)
+    application.add_handler(
+        CommandHandler("scan", scan_command)
     )
 
-    print(
-        "🚀 Memecoin Early Scanner läuft!"
+    application.add_handler(
+        CommandHandler("paper", paper_command)
     )
 
-    try:
+    application.add_handler(
+        CommandHandler("buy", buy_command)
+    )
 
-        await asyncio.Event().wait()
+    print("Memecoin Scanner wird gestartet...")
 
-    finally:
-
-        scanner.cancel()
-
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+    application.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
