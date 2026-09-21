@@ -243,14 +243,51 @@ async def get_token_pairs(chain, address):
 
 
 async def get_latest_token_profiles():
+    """
+    Holt aktuelle Solana-Pairs direkt über die
+    DexScreener Search API.
+
+    Dadurch ist der Scanner nicht ausschließlich
+    von /token-profiles/latest/v1 abhängig.
+    """
+
     data = await get_json(
-        f"{DEXSCREENER_API}/token-profiles/latest/v1"
+        f"{DEXSCREENER_API}/latest/dex/search",
+        params={
+            "q": "SOL"
+        }
     )
 
-    if not isinstance(data, list):
+    if not isinstance(data, dict):
         return []
 
-    return data
+    pairs = data.get("pairs") or []
+
+    profiles = []
+    seen = set()
+
+    for pair in pairs:
+
+        if pair.get("chainId") != "solana":
+            continue
+
+        base = pair.get("baseToken") or {}
+        address = base.get("address")
+
+        if not address:
+            continue
+
+        if address in seen:
+            continue
+
+        seen.add(address)
+
+        profiles.append({
+            "chainId": "solana",
+            "tokenAddress": address,
+        })
+
+    return profiles
 
 
 # ============================================================
@@ -278,7 +315,6 @@ def calculate_score(pair):
 
     score = 0
 
-    # Liquidität
     if liquidity >= 100_000:
         score += 25
     elif liquidity >= 50_000:
@@ -288,7 +324,6 @@ def calculate_score(pair):
     elif liquidity >= MIN_LIQUIDITY_USD:
         score += 10
 
-    # Volumen
     if volume >= 500_000:
         score += 25
     elif volume >= 100_000:
@@ -298,7 +333,6 @@ def calculate_score(pair):
     elif volume >= MIN_VOLUME_24H:
         score += 10
 
-    # Buy pressure
     total_txns = buys + sells
 
     if total_txns > 0:
@@ -311,13 +345,11 @@ def calculate_score(pair):
         elif buy_ratio >= 0.50:
             score += 8
 
-    # Momentum
     if 5 <= price_change <= 100:
         score += 10
     elif price_change > 100:
         score += 5
 
-    # Alter des Pairs
     created = pair.get("pairCreatedAt")
 
     if created:
@@ -544,15 +576,6 @@ async def solana_risk_check(address):
 # ============================================================
 
 async def early_buyer_snapshot(address):
-    """
-    Heuristische Analyse.
-
-    Diese Funktion liefert einen Snapshot von
-    Transaktionen rund um einen Token.
-
-    Sie ist KEIN vollständiger On-Chain-Buyer-Indexer.
-    """
-
     result = {
         "early_transactions": 0,
         "early_wallets": [],
@@ -754,7 +777,7 @@ async def scan_profiles(application):
 
     if not profiles:
         print(
-            "Keine aktuellen Token-Profile gefunden."
+            "Keine aktuellen Solana-Pairs gefunden."
         )
 
         return {
@@ -798,9 +821,6 @@ async def scan_profiles(application):
 
         analysis = analyze_pair(pair)
 
-        # Kandidat für die manuelle Scan-Ausgabe
-        # Nur Liquidität und Volumen müssen die
-        # Mindestwerte erfüllen.
         if (
             analysis["liquidity"]
             >= MIN_LIQUIDITY_USD
@@ -813,8 +833,6 @@ async def scan_profiles(application):
                 "analysis": analysis,
             })
 
-        # Für einen Alert müssen zusätzlich
-        # die Score-Anforderungen erfüllt sein.
         if (
             analysis["liquidity"]
             < MIN_LIQUIDITY_USD
@@ -906,7 +924,6 @@ async def scan_profiles(application):
 
         alerts_sent += 1
 
-    # Höchsten Score zuerst
     candidates.sort(
         key=lambda item: (
             item["analysis"]["score"],
@@ -1224,9 +1241,6 @@ async def scan_command(
                 "Kandidaten gefunden."
             )
 
-        # Telegram-Nachrichten haben eine maximale
-        # Nachrichtenlänge. Deshalb wird die Ausgabe
-        # bei Bedarf aufgeteilt.
         max_length = 4000
 
         for start in range(
