@@ -872,10 +872,11 @@ async def scan_command(
         "🔎 Manueller Scan gestartet..."
     )
 
-    try:
-        await scan_profiles(
-            update.get_bot().application
-        )
+    try: await scan_profiles(
+    context.application 
+ 
+    
+    
 
         await update.message.reply_text(
             "✅ Scan abgeschlossen."
