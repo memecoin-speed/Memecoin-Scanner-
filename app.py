@@ -740,7 +740,9 @@ async def scanner_loop(application):
 
     while True:
         try:
-            await scan_profiles(application)
+            await scan_profiles(
+                context.application
+            )
 
         except Exception as exc:
             print(f"Scanner error: {exc}")
