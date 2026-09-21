@@ -1,12 +1,9 @@
 import os
-import json
-import time
 import sqlite3
 import asyncio
 from datetime import datetime, timezone
 
 import aiohttp
-import websockets
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -36,31 +33,52 @@ MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "5000"))
 ALERT_SCORE = float(os.getenv("ALERT_SCORE", "65"))
 DB_FILE = os.getenv("DB_FILE", "scanner.db")
 
-# ============================================================
-# VERSION
-# ============================================================
-
-APP_VERSION = "3.0-multichain-memecoin-scanner"
+APP_VERSION = "3.1-multichain-filter"
 
 # ============================================================
-# KNOWN BASE / STABLE SYMBOLS
+# BLOCKLIST
 # ============================================================
 
 BLOCKED_SYMBOLS = {
+    # Native / wrapped assets
     "SOL",
     "WSOL",
+    "ETH",
+    "WETH",
+    "BTC",
+    "WBTC",
+    "BNB",
+    "WBNB",
+    "MATIC",
+    "WMATIC",
+    "AVAX",
+    "WAVAX",
+    "FTM",
+    "WFTM",
+
+    # Stablecoins
     "USDC",
     "USDT",
     "DAI",
-    "WETH",
-    "WBTC",
-    "WBNB",
-    "WMATIC",
-    "WAVAX",
-    "WFTM",
-    "WBTC",
-    "BTC",
-    "ETH",
+    "USDE",
+    "FDUSD",
+    "TUSD",
+    "USDD",
+
+    # Liquid staking
+    "JITOSOL",
+    "MSOL",
+    "BSOL",
+    "STSOL",
+    "JUPSOL",
+    "INF",
+}
+
+BLOCKED_NAME_TERMS = {
+    "WRAPPED",
+    "STAKED SOL",
+    "LIQUID STAKING",
+    "LST",
 }
 
 # ============================================================
@@ -138,8 +156,6 @@ async def post_json(session, url, payload):
 
 def safe_float(value, default=0):
     try:
-        if value is None:
-            return default
         return float(value)
     except Exception:
         return default
@@ -147,18 +163,9 @@ def safe_float(value, default=0):
 
 def safe_int(value, default=0):
     try:
-        if value is None:
-            return default
         return int(value)
     except Exception:
         return default
-
-
-def is_blocked_token(symbol):
-    if not symbol:
-        return True
-
-    return symbol.upper().strip() in BLOCKED_SYMBOLS
 
 
 def now_iso():
@@ -166,10 +173,39 @@ def now_iso():
 
 
 # ============================================================
+# TOKEN FILTER
+# ============================================================
+
+def is_blocked_token(symbol, name=""):
+
+    if not symbol:
+        return True
+
+    symbol_clean = symbol.upper().strip()
+    name_clean = (name or "").upper().strip()
+
+    # Bekannte Base Assets
+    if symbol_clean in BLOCKED_SYMBOLS:
+        return True
+
+    # Wrapped Assets
+    if symbol_clean.startswith("W") and len(symbol_clean) <= 6:
+        return True
+
+    # Bestimmte Staking-/Wrapped-Bezeichnungen
+    for term in BLOCKED_NAME_TERMS:
+        if term in symbol_clean or term in name_clean:
+            return True
+
+    return False
+
+
+# ============================================================
 # SOLANA RPC
 # ============================================================
 
 async def solana_rpc(session, method, params=None):
+
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -185,16 +221,10 @@ async def solana_rpc(session, method, params=None):
 
 
 # ============================================================
-# TOKEN DISCOVERY
+# DEXSCREENER DISCOVERY
 # ============================================================
 
 async def get_latest_token_profiles(session):
-
-    """
-    DexScreener liefert über verschiedene Suchbegriffe
-    Kandidaten. Wir kombinieren mehrere Suchabfragen,
-    damit nicht nur SOL gefunden wird.
-    """
 
     queries = [
         "meme",
@@ -223,10 +253,6 @@ async def get_latest_token_profiles(session):
         if isinstance(pairs, list):
             all_pairs.extend(pairs)
 
-    # --------------------------------------------------------
-    # Filter
-    # --------------------------------------------------------
-
     candidates = {}
 
     for pair in all_pairs:
@@ -235,6 +261,7 @@ async def get_latest_token_profiles(session):
             continue
 
         chain = pair.get("chainId")
+
         base = pair.get("baseToken") or {}
 
         address = base.get("address")
@@ -244,20 +271,16 @@ async def get_latest_token_profiles(session):
         if not chain or not address:
             continue
 
-        if is_blocked_token(symbol):
+        if is_blocked_token(symbol, name):
             continue
 
-        liquidity = (
-            pair.get("liquidity") or {}
-        )
+        liquidity = pair.get("liquidity") or {}
 
         liquidity_usd = safe_float(
             liquidity.get("usd")
         )
 
-        volume = (
-            pair.get("volume") or {}
-        )
+        volume = pair.get("volume") or {}
 
         volume_24h = safe_float(
             volume.get("h24")
@@ -271,7 +294,6 @@ async def get_latest_token_profiles(session):
 
         key = f"{chain}:{address}"
 
-        # Beste Pair-Liquidität behalten
         if key not in candidates:
 
             candidates[key] = pair
@@ -279,7 +301,10 @@ async def get_latest_token_profiles(session):
         else:
 
             old_liquidity = safe_float(
-                (candidates[key].get("liquidity") or {}).get("usd")
+                (
+                    candidates[key].get("liquidity")
+                    or {}
+                ).get("usd")
             )
 
             if liquidity_usd > old_liquidity:
@@ -314,10 +339,7 @@ def calculate_score(pair):
 
     score = 0
 
-    # --------------------------------------------------------
     # Liquidität
-    # --------------------------------------------------------
-
     if liquidity >= 100000:
         score += 25
     elif liquidity >= 50000:
@@ -329,10 +351,7 @@ def calculate_score(pair):
     elif liquidity >= 5000:
         score += 5
 
-    # --------------------------------------------------------
     # Volumen
-    # --------------------------------------------------------
-
     if volume >= 500000:
         score += 25
     elif volume >= 100000:
@@ -344,15 +363,12 @@ def calculate_score(pair):
     else:
         score += 5
 
-    # --------------------------------------------------------
-    # Buy/Sell-Verhältnis
-    # --------------------------------------------------------
+    # Käufe / Verkäufe
+    total = buys + sells
 
-    total_txns = buys + sells
+    if total > 0:
 
-    if total_txns > 0:
-
-        buy_ratio = buys / total_txns
+        buy_ratio = buys / total
 
         if buy_ratio >= 0.65:
             score += 25
@@ -365,10 +381,7 @@ def calculate_score(pair):
         else:
             score += 5
 
-    # --------------------------------------------------------
     # Preisbewegung
-    # --------------------------------------------------------
-
     if 5 <= price_change <= 50:
         score += 15
 
@@ -424,7 +437,7 @@ def analyze_market_risk(pair):
         buy_ratio = buys / (buys + sells)
 
         if buy_ratio < 0.40:
-            risks.append("Verkaufsdruck")
+            risks.append("Mehr Verkäufe als Käufe")
 
     if price_change > 100:
         risks.append("Extremer Preisanstieg")
@@ -480,7 +493,7 @@ async def solana_risk_check(session, token_address):
 
         if not account:
             result["warnings"].append(
-                "Token-Mint nicht gefunden"
+                "Mint nicht gefunden"
             )
             return result
 
@@ -500,42 +513,24 @@ async def solana_risk_check(session, token_address):
             "freezeAuthority"
         )
 
-        supply_info = info.get(
-            "supply"
-        )
-
         result["supply"] = safe_float(
-            supply_info
+            info.get("supply")
         )
-
-        # ----------------------------------------------------
-        # Mint Authority
-        # ----------------------------------------------------
 
         if result["mint_authority"]:
             result["warnings"].append(
                 "Mint Authority aktiv"
             )
 
-        # ----------------------------------------------------
-        # Freeze Authority
-        # ----------------------------------------------------
-
         if result["freeze_authority"]:
             result["warnings"].append(
                 "Freeze Authority aktiv"
             )
 
-        # ----------------------------------------------------
-        # Largest Token Accounts
-        # ----------------------------------------------------
-
         largest = await solana_rpc(
             session,
             "getTokenLargestAccounts",
-            [
-                token_address
-            ]
+            [token_address]
         )
 
         if largest:
@@ -554,11 +549,9 @@ async def solana_risk_check(session, token_address):
 
                 for account in accounts[:10]:
 
-                    amount = safe_float(
+                    top_amount += safe_float(
                         account.get("amount")
                     )
-
-                    top_amount += amount
 
                 share = (
                     top_amount / total
@@ -576,18 +569,10 @@ async def solana_risk_check(session, token_address):
                         "Hohe Top-10-Konzentration"
                     )
 
-        # ----------------------------------------------------
-        # Risk Level
-        # ----------------------------------------------------
-
-        warning_count = len(
-            result["warnings"]
-        )
-
-        if warning_count == 0:
+        if not result["warnings"]:
             result["risk"] = "LOW"
 
-        elif warning_count == 1:
+        elif len(result["warnings"]) == 1:
             result["risk"] = "MEDIUM"
 
         else:
@@ -595,7 +580,7 @@ async def solana_risk_check(session, token_address):
 
         return result
 
-    except Exception as e:
+    except Exception:
 
         result["warnings"].append(
             "On-Chain-Prüfung fehlgeschlagen"
@@ -610,7 +595,10 @@ async def solana_risk_check(session, token_address):
 
 def format_risk(risk):
 
-    level = risk.get("risk", "UNKNOWN")
+    level = risk.get(
+        "risk",
+        "UNKNOWN"
+    )
 
     if level == "LOW":
         return "🟢 Niedrig"
@@ -621,23 +609,22 @@ def format_risk(risk):
     if level == "HIGH":
         return "🔴 Hoch"
 
-    return "⚪ Unbekannt"
+    return "⚪ Nicht verfügbar"
 
 
 # ============================================================
 # EARLY BUYER SNAPSHOT
 # ============================================================
 
-async def early_buyer_snapshot(session, chain, pair):
-
-    """
-    Aktuell bewusst nur Snapshot.
-    Keine echte Gewinnprognose und kein automatischer Kauf.
-    """
+async def early_buyer_snapshot(
+    session,
+    chain,
+    pair
+):
 
     result = {
         "available": False,
-        "buyers": [],
+        "buyers": []
     }
 
     if chain != "solana":
@@ -682,74 +669,20 @@ async def early_buyer_snapshot(session, chain, pair):
                 "signature"
             )
 
-            if not signature:
-                continue
-
-            result["buyers"].append(
-                signature
-            )
+            if signature:
+                result["buyers"].append(
+                    signature
+                )
 
         return result
 
     except Exception:
+
         return result
 
 
 # ============================================================
-# ALERT
-# ============================================================
-
-async def send_alert(context, candidate):
-
-    if not TELEGRAM_BOT_TOKEN:
-        return
-
-    try:
-
-        risk = candidate.get(
-            "onchain_risk",
-            {}
-        )
-
-        warnings = risk.get(
-            "warnings",
-            []
-        )
-
-        warning_text = ", ".join(
-            warnings
-        ) if warnings else "Keine"
-
-        message = (
-            "🚨 MEMECOIN ALERT\n\n"
-            f"🪙 {candidate['name']} "
-            f"({candidate['symbol']})\n"
-            f"⛓️ Chain: {candidate['chain']}\n"
-            f"⭐ Score: {candidate['score']}/100\n"
-            f"💧 Liquidität: "
-            f"${candidate['liquidity']:,.0f}\n"
-            f"📊 Volumen 24h: "
-            f"${candidate['volume']:,.0f}\n"
-            f"🟢 Käufe: {candidate['buys']}\n"
-            f"🔴 Verkäufe: {candidate['sells']}\n"
-            f"📈 24h: {candidate['price_change']:.2f}%\n\n"
-            f"🔐 On-Chain Risiko: "
-            f"{format_risk(risk)}\n"
-            f"⚠️ {warning_text}\n\n"
-            f"🔗 {candidate['url']}"
-        )
-
-        await context.bot.send_message(
-            chat_id=ALLOWED_CHAT_ID,
-            text=message
-        )
-
-    except Exception:
-        pass
-
-
-# ============================================================
-# SCAN
+# PERFORM SCAN
 # ============================================================
 
 async def perform_scan():
@@ -797,11 +730,17 @@ async def perform_scan():
                     continue
 
                 liquidity = safe_float(
-                    (pair.get("liquidity") or {}).get("usd")
+                    (
+                        pair.get("liquidity")
+                        or {}
+                    ).get("usd")
                 )
 
                 volume = safe_float(
-                    (pair.get("volume") or {}).get("h24")
+                    (
+                        pair.get("volume")
+                        or {}
+                    ).get("h24")
                 )
 
                 txns = pair.get("txns") or {}
@@ -816,7 +755,10 @@ async def perform_scan():
                 )
 
                 price_change = safe_float(
-                    (pair.get("priceChange") or {}).get("h24")
+                    (
+                        pair.get("priceChange")
+                        or {}
+                    ).get("h24")
                 )
 
                 score = calculate_score(
@@ -834,12 +776,13 @@ async def perform_scan():
 
                 if chain == "solana":
 
-                    onchain_risk = await solana_risk_check(
-                        session,
-                        address
+                    onchain_risk = (
+                        await solana_risk_check(
+                            session,
+                            address
+                        )
                     )
 
-                    # Sicherheitsabzug
                     if onchain_risk["risk"] == "HIGH":
                         score -= 15
 
@@ -853,7 +796,10 @@ async def perform_scan():
 
                 url = pair.get(
                     "url",
-                    f"https://dexscreener.com/{chain}/{pair.get('pairAddress', '')}"
+                    "https://dexscreener.com/"
+                    + str(chain)
+                    + "/"
+                    + str(pair.get("pairAddress", ""))
                 )
 
                 candidate = {
@@ -879,9 +825,9 @@ async def perform_scan():
             except Exception:
                 continue
 
-    # ========================================================
-    # SORT
-    # ========================================================
+    # --------------------------------------------------------
+    # Sortieren
+    # --------------------------------------------------------
 
     candidates.sort(
         key=lambda x: (
@@ -892,17 +838,11 @@ async def perform_scan():
         reverse=True
     )
 
-    # maximal 5 Kandidaten
     candidates = candidates[:5]
-
-    # ========================================================
-    # ALERT COUNT
-    # ========================================================
 
     for candidate in candidates:
 
         if candidate["score"] >= ALERT_SCORE:
-
             alerts += 1
 
     return {
@@ -924,9 +864,10 @@ def allowed(update):
     if not update.effective_chat:
         return False
 
-    return str(
-        update.effective_chat.id
-    ) == str(ALLOWED_CHAT_ID)
+    return (
+        str(update.effective_chat.id)
+        == str(ALLOWED_CHAT_ID)
+    )
 
 
 # ============================================================
@@ -946,8 +887,8 @@ async def start_command(
         f"Version: {APP_VERSION}\n\n"
         "/scan – Scanner starten\n"
         "/status – Status anzeigen\n"
-        "/paper – Paper-Trading Status\n"
-        "/buy – simulierten Trade eröffnen"
+        "/paper – Paper Trading\n"
+        "/buy – Paper Buy"
     )
 
 
@@ -964,11 +905,18 @@ async def status_command(
         return
 
     await update.message.reply_text(
-        "🟢 Scanner online\n\n"
+        "🟢 BOT STATUS\n\n"
+        "Scanner: aktiv\n"
+        "DexScreener: aktiv\n"
+        "Paper Trading: aktiv\n"
+        "Solana Analyse: aktiv\n"
+        "Risikoanalyse: aktiv\n\n"
         f"Version: {APP_VERSION}\n"
         f"Scan-Intervall: {SCAN_INTERVAL}s\n"
-        f"Min. Liquidität: ${MIN_LIQUIDITY_USD:,.0f}\n"
-        f"Min. 24h Volumen: ${MIN_VOLUME_24H:,.0f}\n"
+        f"Min. Liquidität: "
+        f"${MIN_LIQUIDITY_USD:,.0f}\n"
+        f"Min. Volumen: "
+        f"${MIN_VOLUME_24H:,.0f}\n"
         f"Alert Score: {ALERT_SCORE:.0f}"
     )
 
@@ -993,8 +941,10 @@ async def scan_command(
 
     text = (
         "✅ Scan abgeschlossen.\n\n"
-        f"🔎 Geprüft: {result['checked']}\n"
-        f"🚨 Alerts: {result['alerts']}\n\n"
+        f"🔎 Geprüft: "
+        f"{result['checked']}\n"
+        f"🚨 Kandidaten: "
+        f"{len(result['candidates'])}\n\n"
         "🏆 TOP-KANDIDATEN:\n"
     )
 
@@ -1016,34 +966,31 @@ async def scan_command(
                 {}
             )
 
-            warnings = candidate.get(
+            market_risks = candidate.get(
                 "risks",
                 []
-            )
-
-            warning_text = ", ".join(
-                warnings
             )
 
             text += (
                 f"\n{index}. "
                 f"{candidate['name']} "
                 f"({candidate['symbol']})\n"
-                f"   ⛓️ Chain: {candidate['chain']}\n"
+                f"   ⛓️ Chain: "
+                f"{candidate['chain']}\n"
                 f"   ⭐ Score: "
                 f"{candidate['score']:.0f}/100\n"
                 f"   💧 Liquidität: "
-                f"${candidate['liquidity']:,.2f}\n"
+                f"${candidate['liquidity']:,.1f}\n"
                 f"   📊 Volumen 24h: "
-                f"${candidate['volume']:,.2f}\n"
+                f"${candidate['volume']:,.1f}\n"
                 f"   🟢 Käufe: "
                 f"{candidate['buys']} | "
                 f"🔴 Verkäufe: "
                 f"{candidate['sells']}\n"
                 f"   📈 24h: "
                 f"{candidate['price_change']:.2f}%\n"
-                f"   ⚠️ Risiken: "
-                f"{warning_text}\n"
+                f"   ⚠️ Markt-Risiken: "
+                f"{', '.join(market_risks)}\n"
                 f"   🔐 On-Chain Risiko: "
                 f"{format_risk(risk)}\n"
             )
@@ -1084,8 +1031,12 @@ async def paper_command(
     )
 
     rows = conn.execute("""
-        SELECT chain, symbol, side, price,
-               amount_usd, created_at
+        SELECT chain,
+               symbol,
+               side,
+               price,
+               amount_usd,
+               created_at
         FROM paper_trades
         ORDER BY id DESC
         LIMIT 10
@@ -1133,8 +1084,8 @@ async def buy_command(
 
     await update.message.reply_text(
         "🧪 Paper-Trading ist aktiv.\n\n"
-        "Es werden keine echten Käufe ausgeführt.\n"
-        "Verwende zuerst /scan."
+        "Es wird kein echter Kauf ausgeführt.\n"
+        "Nutze zuerst /scan."
     )
 
 
@@ -1148,18 +1099,13 @@ async def scanner_loop(application):
 
         try:
 
-            result = await perform_scan()
+            await perform_scan()
 
-            for candidate in result["candidates"]:
+        except Exception as e:
 
-                if candidate["score"] >= ALERT_SCORE:
-
-                    # Nur als Info:
-                    # echter Trade ist weiterhin deaktiviert.
-                    pass
-
-        except Exception:
-            pass
+            print(
+                f"Scanner error: {e}"
+            )
 
         await asyncio.sleep(
             SCAN_INTERVAL
