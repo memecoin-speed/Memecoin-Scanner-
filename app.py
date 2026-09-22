@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.4.3-pro-watchdog"
+APP_VERSION = "3.4.4-pro-fast-discovery"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -103,10 +103,10 @@ MAX_PRICE_CHANGE_24H = 500
 
 EARLY_BUYER_WINDOW_HOURS = 24
 
-SOLANA_SIGNATURE_LIMIT = int(os.getenv("SOLANA_SIGNATURE_LIMIT", "40"))
-RPC_CALL_TIMEOUT = int(os.getenv("RPC_CALL_TIMEOUT", "10"))
-CANDIDATE_ANALYSIS_TIMEOUT = int(os.getenv("CANDIDATE_ANALYSIS_TIMEOUT", "55"))
-DISCOVERY_STAGE_TIMEOUT = int(os.getenv("DISCOVERY_STAGE_TIMEOUT", "70"))
+SOLANA_SIGNATURE_LIMIT = int(os.getenv("SOLANA_SIGNATURE_LIMIT", "20"))
+RPC_CALL_TIMEOUT = int(os.getenv("RPC_CALL_TIMEOUT", "6"))
+CANDIDATE_ANALYSIS_TIMEOUT = int(os.getenv("CANDIDATE_ANALYSIS_TIMEOUT", "28"))
+DISCOVERY_STAGE_TIMEOUT = int(os.getenv("DISCOVERY_STAGE_TIMEOUT", "38"))
 SOLANA_DIRECT_LIMIT = int(os.getenv("SOLANA_DIRECT_LIMIT", "25"))
 SOLANA_DIRECT_TTL_SECONDS = int(os.getenv("SOLANA_DIRECT_TTL_SECONDS", "900"))
 solana_direct_signatures = {}
@@ -608,7 +608,7 @@ async def get_direct_solana_pairs(session):
     return pairs, {"signatures":len(sigs),"mints":len(mints),"pairs":len(pairs),"enrich429":enrich429,"rpc":";".join(health)}
 
 async def discover_candidates():
-
+    """Fast, fault-isolated discovery. No single provider may zero the whole scan."""
     candidates = []
     stats = {
         "profiles": 0, "pair_responses": 0, "pairs": 0,
@@ -620,94 +620,81 @@ async def discover_candidates():
         "pair_errors": 0,
     }
 
-    async with aiohttp.ClientSession() as session:
-        # Direct Solana on-chain discovery is independent of market-data indexers.
-        direct_sol, direct_health = await get_direct_solana_pairs(session)
-        sol_gt, sol_health = await get_gecko_new_pools(session, "solana", "solana")
-        eth_gt, eth_health = await get_gecko_new_pools(session, "eth", "ethereum")
-        profiles, source_health = await get_discovery_profiles(session)
-        source_health["solana_direct"] = f"sigs:{direct_health['signatures']} mints:{direct_health['mints']} pairs:{direct_health['pairs']} enrich429:{direct_health['enrich429']}"
-        source_health["gecko_solana"] = sol_health
-        source_health["gecko_ethereum"] = eth_health
-        stats["source_health"] = source_health
-        stats["profiles"] = len(profiles)
+    async def safe(label, coro, timeout, fallback):
+        try:
+            value = await asyncio.wait_for(coro, timeout=timeout)
+            return value, None
+        except asyncio.TimeoutError:
+            return fallback, f"{label}=timeout:{timeout}s"
+        except Exception as exc:
+            return fallback, f"{label}={type(exc).__name__}"
 
-        # Gecko pairs can be filtered immediately. DexScreener profiles are enriched
-        # conservatively and only when available, preventing 429 from zeroing scans.
-        results = [[p] for p in (direct_sol + sol_gt + eth_gt)]
-        profiles = profiles[:30]
-        for profile in profiles:
-            chain = profile.get("chainId"); address = profile.get("tokenAddress")
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
+        # Run independent sources concurrently. Direct Solana gets a tighter budget because
+        # market feeds should still return quickly when a public RPC is slow.
+        gt_sol_t = asyncio.create_task(safe("gecko_solana", get_gecko_new_pools(session,"solana","solana"), 10, ([],"timeout")))
+        gt_eth_t = asyncio.create_task(safe("gecko_ethereum", get_gecko_new_pools(session,"eth","ethereum"), 10, ([],"timeout")))
+        dex_t = asyncio.create_task(safe("dex", get_discovery_profiles(session), 16, ([],{})))
+        direct_t = asyncio.create_task(safe("solana_direct", get_direct_solana_pairs(session), 18, ([],{"signatures":0,"mints":0,"pairs":0,"enrich429":0,"rpc":"timeout"})))
+
+        (sol_pack, sol_err), (eth_pack, eth_err), (dex_pack, dex_err), (direct_pack, direct_err) = await asyncio.gather(gt_sol_t, gt_eth_t, dex_t, direct_t)
+        sol_gt, sol_health = sol_pack
+        eth_gt, eth_health = eth_pack
+        profiles, source_health = dex_pack
+        direct_sol, direct_health = direct_pack
+        source_health = dict(source_health or {})
+        if dex_err: source_health["dex_watchdog"] = dex_err
+        source_health["gecko_solana"] = sol_err or sol_health
+        source_health["gecko_ethereum"] = eth_err or eth_health
+        source_health["solana_direct"] = direct_err or f"sigs:{direct_health.get('signatures',0)} mints:{direct_health.get('mints',0)} pairs:{direct_health.get('pairs',0)} enrich429:{direct_health.get('enrich429',0)}"
+        stats["source_health"] = source_health
+        stats["profiles"] = len(profiles or [])
+
+        results = [[p] for p in ((direct_sol or []) + (sol_gt or []) + (eth_gt or []))]
+        # Enrich only a small profile batch in fast mode. Each lookup has its own timeout.
+        for profile in (profiles or [])[:12]:
+            chain=profile.get("chainId"); address=profile.get("tokenAddress")
             if not chain or not address:
                 stats["missing_data"] += 1; continue
-            try:
-                pairs = await get_token_pairs(session, chain, address)
-                results.append(pairs)
-            except Exception:
-                stats["pair_errors"] += 1
-            await asyncio.sleep(0.35)
+            pairs, err = await safe("pair", get_token_pairs(session,chain,address), 5, [])
+            if err: stats["pair_errors"] += 1
+            if pairs: results.append(pairs)
         stats["pair_responses"] = len(results)
 
         for pairs in results:
-            if isinstance(pairs, Exception):
-                stats["pair_errors"] += 1
-                continue
-            for pair in pairs:
+            for pair in pairs or []:
                 stats["pairs"] += 1
                 try:
-                    chain = (pair.get("chainId") or "").lower()
-                    if chain == "solana": stats["solana_pairs"] += 1
-                    elif chain == "ethereum": stats["ethereum_pairs"] += 1
-                    else:
-                        stats["unsupported_chain"] += 1
-                        continue
-
-                    pair_address = pair.get("pairAddress")
-                    base = pair.get("baseToken") or {}
-                    name = base.get("name", "Unknown")
-                    symbol = base.get("symbol", "UNKNOWN")
-                    token_address = base.get("address")
-                    if not chain or not pair_address or not token_address:
-                        stats["missing_data"] += 1; continue
-                    if is_blocked_token(symbol, name):
-                        stats["blocked"] += 1; continue
-
-                    liquidity = clean_number((pair.get("liquidity") or {}).get("usd"))
-                    volume = clean_number((pair.get("volume") or {}).get("h24"))
-                    txns_24h = ((pair.get("txns") or {}).get("h24") or {})
-                    buys = int(clean_number(txns_24h.get("buys")))
-                    sells = int(clean_number(txns_24h.get("sells")))
-                    total_txns = buys + sells
-                    price_change = clean_number((pair.get("priceChange") or {}).get("h24"))
-                    age_hours = pair_age_hours(pair)
-
+                    chain=(pair.get("chainId") or "").lower()
+                    if chain=="solana": stats["solana_pairs"] += 1
+                    elif chain=="ethereum": stats["ethereum_pairs"] += 1
+                    else: stats["unsupported_chain"] += 1; continue
+                    pair_address=pair.get("pairAddress"); base=pair.get("baseToken") or {}
+                    name=base.get("name","Unknown"); symbol=base.get("symbol","UNKNOWN"); token_address=base.get("address")
+                    if not pair_address or not token_address: stats["missing_data"] += 1; continue
+                    if is_blocked_token(symbol,name): stats["blocked"] += 1; continue
+                    liquidity=clean_number((pair.get("liquidity") or {}).get("usd")); volume=clean_number((pair.get("volume") or {}).get("h24"))
+                    tx=(pair.get("txns") or {}).get("h24") or {}; buys=int(clean_number(tx.get("buys"))); sells=int(clean_number(tx.get("sells"))); total=buys+sells
+                    price_change=clean_number((pair.get("priceChange") or {}).get("h24")); age_hours=pair_age_hours(pair)
                     if age_hours is None: stats["age_missing"] += 1; continue
-                    if age_hours * 60 < MIN_PAIR_AGE_MINUTES: stats["too_new"] += 1; continue
+                    if age_hours*60 < MIN_PAIR_AGE_MINUTES: stats["too_new"] += 1; continue
                     if age_hours > MAX_PAIR_AGE_HOURS: stats["too_old"] += 1; continue
                     if liquidity < MIN_LIQUIDITY_USD: stats["liq_low"] += 1; continue
                     if liquidity > MAX_LIQUIDITY_USD: stats["liq_high"] += 1; continue
                     if volume < MIN_VOLUME_24H: stats["vol_low"] += 1; continue
                     if volume > MAX_VOLUME_24H: stats["vol_high"] += 1; continue
-                    if total_txns < MIN_TXNS_24H: stats["txns_low"] += 1; continue
+                    if total < MIN_TXNS_24H: stats["txns_low"] += 1; continue
                     if price_change > MAX_PRICE_CHANGE_24H: stats["price_change_high"] += 1; continue
-                    if not meme_signal(name, symbol): stats["meme_filter"] += 1; continue
-
-                    candidates.append({
-                        "chain": chain, "address": token_address, "pair_address": pair_address,
-                        "name": name, "symbol": symbol, "liquidity": liquidity,
-                        "volume": volume, "buys": buys, "sells": sells, "txns": total_txns,
-                        "price_change": price_change, "age_hours": age_hours,
-                        "price_usd": clean_number(pair.get("priceUsd")), "url": pair.get("url"),
-                    })
+                    if not meme_signal(name,symbol): stats["meme_filter"] += 1; continue
+                    candidates.append({"chain":chain,"address":token_address,"pair_address":pair_address,"name":name,"symbol":symbol,"liquidity":liquidity,"volume":volume,"buys":buys,"sells":sells,"txns":total,"price_change":price_change,"age_hours":age_hours,"price_usd":clean_number(pair.get("priceUsd")),"url":pair.get("url")})
                     stats["passed"] += 1
                 except Exception:
                     stats["pair_errors"] += 1
 
-    unique = {}
-    for candidate in candidates:
-        key = (candidate["chain"], candidate["pair_address"])
-        if key not in unique: unique[key] = candidate
-    stats["passed_unique"] = len(unique)
+    unique={}
+    for c in candidates:
+        unique.setdefault((c["chain"],c["pair_address"]),c)
+    stats["passed_unique"]=len(unique)
     return list(unique.values()), stats
 
 
