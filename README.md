@@ -15,3 +15,9 @@ This build adds defense-in-depth for Early Buyer alerts:
 - Discovery behavior from v3.3.8 remains unchanged.
 
 Use `/start` after deployment and verify `Version: 3.3.9-pro-buyer-gate`, then run `/scan`.
+
+## v3.4.1 stability
+- `/scan` runs in a background task so `/start` and `/status` stay responsive.
+- Manual and automatic scans are serialized to avoid RPC request storms.
+- Telegram HTTP timeouts are increased and scan execution has a 4-minute ceiling.
+- The strict >=2 verified buyer-wallet gate remains enabled.

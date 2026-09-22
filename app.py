@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.4.0-pro-strict-buyer-gate"
+APP_VERSION = "3.4.1-pro-stability"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -76,6 +76,8 @@ SOLANA_PROGRAM_IDS = [x.strip() for x in os.getenv(
 
 scan_trigger = asyncio.Event()
 last_scan_cache = []
+scan_lock = asyncio.Lock()
+manual_scan_tasks = set()
 
 
 # ============================================================
@@ -1899,81 +1901,56 @@ def format_diagnostics(stats):
     )
 
 
-async def scan(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not allowed(update):
-        return
-
-    await update.message.reply_text(
-        f"🔎 Starte {APP_VERSION} Early-Buyer-Analyse...\n\n"
-        "Ethereum + Solana werden "
-        "on-chain geprüft."
-    )
-
-    result = await perform_scan()
-
-    checked = result[
-        "checked"
-    ]
-
-    candidates = result[
-        "candidates"
-    ]
-
-    # Defense in depth: Telegram must never display a TOP-EARLY candidate
-    # unless at least two on-chain buyer wallets were actually verified.
+async def _send_scan_result(message, result):
+    checked = result["checked"]
+    candidates = result["candidates"]
     candidates = [
         c for c in candidates
         if int((c.get("early_buyers") or {}).get("buyer_count", 0) or 0) >= 2
         and len({str(b.get("wallet", "")).strip() for b in ((c.get("early_buyers") or {}).get("buyers") or []) if isinstance(b, dict) and str(b.get("wallet", "")).strip()}) >= 2
     ]
-
-    diagnostics = result.get("diagnostics", {})
-    diagnostic_text = format_diagnostics(diagnostics)
-
+    diagnostic_text = format_diagnostics(result.get("diagnostics", {}))
     if not candidates:
+        text = ("✅ Scan abgeschlossen.\n\n" f"🔎 Geprüft: {checked}\n" "🚨 Kandidaten: 0\n\n" "❌ Keine passenden Early-Kandidaten gefunden." + diagnostic_text)
+    else:
+        text = ("✅ Scan abgeschlossen.\n\n" f"🔎 Geprüft: {checked}\n" f"🚨 Kandidaten: {len(candidates)}\n\n" "🏆 TOP-EARLY-KANDIDATEN:\n\n")
+        for index, candidate in enumerate(candidates, 1):
+            text += format_candidate(index, candidate) + "\n\n"
+        text += diagnostic_text
+    try:
+        await message.reply_text(text, disable_web_page_preview=True, read_timeout=45, write_timeout=45, connect_timeout=20, pool_timeout=20)
+    except Exception as exc:
+        print("[SCAN RESULT SEND ERROR]", type(exc).__name__, str(exc))
 
-        await update.message.reply_text(
-            "✅ Scan abgeschlossen.\n\n"
-            f"🔎 Geprüft: {checked}\n"
-            "🚨 Kandidaten: 0\n\n"
-            "❌ Keine passenden "
-            "Early-Kandidaten gefunden."
-            + diagnostic_text
-        )
 
+async def _manual_scan_worker(message):
+    try:
+        async with scan_lock:
+            result = await asyncio.wait_for(perform_scan(), timeout=240)
+        await _send_scan_result(message, result)
+    except asyncio.TimeoutError:
+        try:
+            await message.reply_text("⚠️ Scan nach 4 Minuten abgebrochen. Der Bot bleibt aktiv; bitte später erneut /scan senden.", read_timeout=45, write_timeout=45, connect_timeout=20, pool_timeout=20)
+        except Exception as exc:
+            print("[SCAN TIMEOUT SEND ERROR]", type(exc).__name__, str(exc))
+    except Exception as exc:
+        print("[MANUAL SCAN ERROR]", type(exc).__name__, str(exc))
+        try:
+            await message.reply_text("⚠️ Scan fehlgeschlagen, der Bot läuft weiter. Bitte später erneut /scan senden.", read_timeout=45, write_timeout=45, connect_timeout=20, pool_timeout=20)
+        except Exception:
+            pass
+
+
+async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
         return
-
-    text = (
-        "✅ Scan abgeschlossen.\n\n"
-        f"🔎 Geprüft: {checked}\n"
-        f"🚨 Kandidaten: "
-        f"{len(candidates)}\n\n"
-        "🏆 TOP-EARLY-KANDIDATEN:\n\n"
-    )
-
-    for index, candidate in enumerate(
-        candidates,
-        1
-    ):
-
-        text += (
-            format_candidate(
-                index,
-                candidate
-            )
-            + "\n\n"
-        )
-
-    text += diagnostic_text
-
     await update.message.reply_text(
-        text,
-        disable_web_page_preview=True
+        f"🔎 {APP_VERSION}: Scan gestartet.\n\nDie On-Chain-Analyse läuft im Hintergrund; /start und /status bleiben währenddessen verfügbar.",
+        read_timeout=45, write_timeout=45, connect_timeout=20, pool_timeout=20,
     )
+    task = asyncio.create_task(_manual_scan_worker(update.message))
+    manual_scan_tasks.add(task)
+    task.add_done_callback(manual_scan_tasks.discard)
 
 
 async def paper(
@@ -2130,13 +2107,14 @@ async def scanner_loop(
     application
 ):
 
+    await asyncio.sleep(20)
+
     while True:
 
         try:
 
-            result = (
-                await perform_scan()
-            )
+            async with scan_lock:
+                result = await asyncio.wait_for(perform_scan(), timeout=240)
 
             candidates = result[
                 "candidates"
@@ -2202,12 +2180,16 @@ def main():
 
     application = (
         ApplicationBuilder()
-        .token(
-            TELEGRAM_BOT_TOKEN
-        )
-        .post_init(
-            post_init
-        )
+        .token(TELEGRAM_BOT_TOKEN)
+        .connect_timeout(20)
+        .read_timeout(45)
+        .write_timeout(45)
+        .pool_timeout(20)
+        .get_updates_connect_timeout(20)
+        .get_updates_read_timeout(60)
+        .get_updates_write_timeout(45)
+        .get_updates_pool_timeout(20)
+        .post_init(post_init)
         .build()
     )
 
