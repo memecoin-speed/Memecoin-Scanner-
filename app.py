@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.3.9-pro-buyer-gate"
+APP_VERSION = "3.4.0-pro-strict-buyer-gate"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -1617,11 +1617,24 @@ async def perform_scan():
         reverse=True
     )
 
-    last_scan_cache = analyzed[:10]
+    # FINAL POSTCONDITION: rebuild the output list from verified evidence only.
+    # This is deliberately separate from the loop above so a stale/pre-gate list
+    # can never leak into Telegram or the background alert loop.
+    verified = []
+    for item in analyzed:
+        eb = item.get("early_buyers") or {}
+        buyers = eb.get("buyers") or []
+        buyer_count = int(eb.get("buyer_count", 0) or 0)
+        unique_wallets = {str(b.get("wallet", "")).strip() for b in buyers if isinstance(b, dict) and str(b.get("wallet", "")).strip()}
+        # Require both the reported count and at least two concrete unique wallets.
+        if buyer_count >= 2 and len(unique_wallets) >= 2:
+            verified.append(item)
+
+    last_scan_cache = verified[:10]
     return {
         "checked": len(raw),
         "analyzed": len(raw),
-        "candidates": analyzed[:5],
+        "candidates": verified[:5],
         "diagnostics": {**diagnostics, "buyer_diag": buyer_diag},
     }
 
@@ -1915,6 +1928,7 @@ async def scan(
     candidates = [
         c for c in candidates
         if int((c.get("early_buyers") or {}).get("buyer_count", 0) or 0) >= 2
+        and len({str(b.get("wallet", "")).strip() for b in ((c.get("early_buyers") or {}).get("buyers") or []) if isinstance(b, dict) and str(b.get("wallet", "")).strip()}) >= 2
     ]
 
     diagnostics = result.get("diagnostics", {})

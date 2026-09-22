@@ -1,3 +1,10 @@
+# Memecoin Scanner v3.4.0 Pro Strict Buyer Gate
+
+- Final candidate list is rebuilt only from tokens with at least 2 concrete, unique on-chain buyer wallet addresses.
+- A reported buyer_count alone is not sufficient.
+- The same strict postcondition protects Telegram output and the background alert cache.
+- Discovery and existing buyer diagnostics are retained.
+
 # Memecoin Scanner v3.3.9 Pro Buyer Gate
 
 This build adds defense-in-depth for Early Buyer alerts:
