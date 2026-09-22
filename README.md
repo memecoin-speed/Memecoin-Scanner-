@@ -1,16 +1,12 @@
-# Memecoin Scanner v3.3.5 Pro Fallback
+# Memecoin Scanner v3.3.6 Pro On-Chain
 
-Fix für `Profile geladen: 0`: Die Discovery hängt nicht mehr an nur einem DexScreener-Feed.
+Changes:
+- Solana Early-Buyer RPC now has automatic fallback support.
+- Default fallback: `https://solana-rpc.publicnode.com`.
+- `SOLANA_RPC_FALLBACKS` can contain comma-separated additional RPC URLs.
+- `/scan` now distinguishes RPC/no-data failures from real zero-buyer results.
+- Shows sampled Solana signatures and parsed transactions when buyer data is missing.
+- A coin is only a TOP-EARLY candidate when at least 2 buyer wallets were actually detected on-chain.
+- Market score can no longer by itself create a TOP-EARLY alert.
 
-## Neu
-- kombiniert `token-profiles/latest`, `token-boosts/latest` und `token-boosts/top`
-- dedupliziert Solana-/Ethereum-Tokens vor der Pair-Abfrage
-- zeigt den Status jeder Discovery-Quelle direkt in `/scan`
-- eine ausgefallene/leer zurückkommende Quelle setzt den gesamten Scanner nicht mehr auf 0
-- Versionskennung: `3.3.5-pro-multisource`
-
-Die bestehende Early-Buyer-, Risiko-, Telegram- und Paper-Trading-Logik bleibt erhalten.
-
-
-## v3.3.5
-Independent GeckoTerminal new-pool discovery for Solana and Ethereum. DexScreener is now optional enrichment; HTTP 429 no longer makes discovery return zero. DexScreener discovery calls are sequential/rate-limited.
+No private key or real-money auto-trading is included.

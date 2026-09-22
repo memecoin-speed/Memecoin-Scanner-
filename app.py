@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.3.5-pro-fallback"
+APP_VERSION = "3.3.6-pro-onchain"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -94,7 +94,10 @@ MAX_PRICE_CHANGE_24H = 500
 
 EARLY_BUYER_WINDOW_HOURS = 24
 
-SOLANA_SIGNATURE_LIMIT = 50
+SOLANA_SIGNATURE_LIMIT = int(os.getenv("SOLANA_SIGNATURE_LIMIT", "80"))
+SOLANA_RPC_FALLBACKS = [x.strip() for x in os.getenv(
+    "SOLANA_RPC_FALLBACKS", "https://solana-rpc.publicnode.com"
+).split(",") if x.strip()]
 
 ETH_LOG_CHUNK_SIZE = 2000
 
@@ -1197,104 +1200,112 @@ def token_balance_map(
     return result
 
 
+async def solana_rpc_with_fallback(session, method, params):
+    """Try the configured Solana RPC first, then fallbacks; return diagnostics."""
+    urls = []
+    for url in [SOLANA_RPC] + SOLANA_RPC_FALLBACKS:
+        if url and url not in urls:
+            urls.append(url)
+    errors = []
+    for url in urls:
+        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        try:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=20)) as response:
+                if response.status != 200:
+                    errors.append(f"{url}:HTTP {response.status}")
+                    continue
+                data = await response.json(content_type=None)
+                if data.get("error"):
+                    err = data["error"]
+                    errors.append(f"{url}:RPC {err.get('code')} {str(err.get('message',''))[:60]}")
+                    continue
+                return data.get("result"), url, errors
+        except Exception as exc:
+            errors.append(f"{url}:{type(exc).__name__}")
+    return None, None, errors
+
+
 async def solana_early_buyers(session, candidate):
     result = {
-        "buyers": [],
-        "buyer_count": 0,
-        "earliest_minutes": None,
-        "status": "⚪ Keine Daten",
+        "buyers": [], "buyer_count": 0, "earliest_minutes": None,
+        "status": "⚪ Keine Daten", "rpc_source": None, "rpc_errors": [],
+        "signatures_found": 0, "transactions_parsed": 0,
     }
+    pair = candidate.get("pair_address") or ""
+    mint = candidate.get("address") or ""
 
-    pair = candidate["pair_address"]
-    mint = candidate["address"]
-
-    # A Solana DEX swap is not guaranteed to be indexed under the pool/pair
-    # address returned by Dexscreener. Query both pool and token mint, then
-    # de-duplicate signatures before parsing token balance deltas.
-    signature_infos = []
-    seen_signatures = set()
+    signature_infos, seen = [], set()
     for address in (pair, mint):
         if not address:
             continue
-        rows = await solana_rpc_call(
-            session,
-            "getSignaturesForAddress",
+        rows, source, errors = await solana_rpc_with_fallback(
+            session, "getSignaturesForAddress",
             [address, {"limit": SOLANA_SIGNATURE_LIMIT, "commitment": "confirmed"}],
         )
+        result["rpc_errors"].extend(errors)
+        if source:
+            result["rpc_source"] = source
         for row in rows or []:
             sig = row.get("signature")
-            if sig and sig not in seen_signatures:
-                seen_signatures.add(sig)
-                signature_infos.append(row)
+            if sig and sig not in seen:
+                seen.add(sig); signature_infos.append(row)
 
+    result["signatures_found"] = len(signature_infos)
     if not signature_infos:
-        result["status"] = "⚪ Keine Token-/Pool-Transaktionen"
+        if result["rpc_errors"]:
+            result["status"] = "🟠 Solana-RPC ohne verwertbare Daten"
+        else:
+            result["status"] = "⚪ Keine Pool-/Token-Transaktionen"
         return result
 
-    # Process oldest first so the result represents the earliest buyers in
-    # the sampled transaction window rather than whichever RPC row came first.
     signature_infos.sort(key=lambda x: x.get("blockTime") or 0)
     found = {}
-
     for signature_info in signature_infos:
         signature = signature_info.get("signature")
         if not signature:
             continue
-        tx = await solana_rpc_call(
-            session,
-            "getTransaction",
-            [signature, {
-                "encoding": "jsonParsed",
-                "commitment": "confirmed",
-                "maxSupportedTransactionVersion": 0,
-            }],
+        tx, source, errors = await solana_rpc_with_fallback(
+            session, "getTransaction",
+            [signature, {"encoding":"jsonParsed", "commitment":"confirmed", "maxSupportedTransactionVersion":0}],
         )
+        result["rpc_errors"].extend(errors)
+        if source:
+            result["rpc_source"] = source
         if not tx:
             continue
+        result["transactions_parsed"] += 1
         meta = tx.get("meta") or {}
         if meta.get("err"):
             continue
-
         pre = token_balance_map(meta.get("preTokenBalances"), mint)
         post = token_balance_map(meta.get("postTokenBalances"), mint)
         block_time = tx.get("blockTime") or signature_info.get("blockTime")
-
         for owner in set(pre) | set(post):
             delta = post.get(owner, 0) - pre.get(owner, 0)
             if delta <= 0 or not owner:
                 continue
-            # Pool/program-owned balances normally have no useful wallet owner;
-            # this also avoids the obvious pair address when it appears as owner.
-            if owner.lower() == pair.lower():
+            if pair and owner.lower() == pair.lower():
                 continue
             current = found.get(owner)
             if current is None:
-                found[owner] = {
-                    "wallet": owner,
-                    "amount": delta,
-                    "block_time": block_time,
-                    "signature": signature,
-                }
+                found[owner] = {"wallet":owner, "amount":delta, "block_time":block_time, "signature":signature}
             else:
                 current["amount"] += delta
                 if block_time and (not current.get("block_time") or block_time < current["block_time"]):
-                    current["block_time"] = block_time
-                    current["signature"] = signature
-        await asyncio.sleep(0.04)
+                    current["block_time"] = block_time; current["signature"] = signature
+        await asyncio.sleep(0.03)
 
     if not found:
-        result["status"] = "⚪ Keine Käufer-Wallets im RPC-Fenster"
+        result["status"] = "⚪ Transaktionen da, aber keine Käufer-Wallets erkannt"
         return result
 
     ordered = sorted(found.values(), key=lambda x: x.get("block_time") or 0)
     result["buyers"] = ordered[:10]
     result["buyer_count"] = len(ordered)
-
     earliest = next((x.get("block_time") for x in ordered if x.get("block_time")), None)
     if earliest:
         result["earliest_minutes"] = max(0, int((time.time() - earliest) / 60))
-
-    result["status"] = "🟢 Frühe Wallet-Käufer erkannt"
+    result["status"] = "🟢 Frühe Wallet-Käufer on-chain erkannt"
     return result
 
 
@@ -1524,13 +1535,11 @@ async def perform_scan():
                 )
             )
 
-            if result[
-                "score"
-            ] >= ALERT_SCORE:
-
-                analyzed.append(
-                    result
-                )
+            # A TOP-EARLY candidate must have actual on-chain buyer evidence.
+            # Market score alone is not enough.
+            if (result["score"] >= ALERT_SCORE and
+                    result.get("early_buyers", {}).get("buyer_count", 0) >= 2):
+                analyzed.append(result)
 
         except Exception as e:
 
@@ -1584,11 +1593,15 @@ def format_early_buyers(
     )
 
     if not buyers:
-
-        return (
-            f"🐳 Early Buyers: {status}\n"
-            f"   Erkannte Wallets: {count}"
-        )
+        extra = ""
+        if "signatures_found" in data:
+            extra += f"\n   RPC-Signaturen: {data.get('signatures_found', 0)} | TX geparst: {data.get('transactions_parsed', 0)}"
+        if data.get("rpc_source"):
+            extra += "\n   RPC-Fallback: aktiv"
+        if data.get("rpc_errors"):
+            extra += f"\n   RPC-Fehler: {len(data.get('rpc_errors', []))}"
+        return (f"🐳 Early Buyers: {status}\n"
+                f"   Erkannte Wallets: {count}{extra}")
 
     text = (
         f"🐳 Early Buyers: {status}\n"
