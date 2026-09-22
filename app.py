@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.4.2-pro-resilient-discovery"
+APP_VERSION = "3.4.3-pro-watchdog"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -103,7 +103,10 @@ MAX_PRICE_CHANGE_24H = 500
 
 EARLY_BUYER_WINDOW_HOURS = 24
 
-SOLANA_SIGNATURE_LIMIT = int(os.getenv("SOLANA_SIGNATURE_LIMIT", "80"))
+SOLANA_SIGNATURE_LIMIT = int(os.getenv("SOLANA_SIGNATURE_LIMIT", "40"))
+RPC_CALL_TIMEOUT = int(os.getenv("RPC_CALL_TIMEOUT", "10"))
+CANDIDATE_ANALYSIS_TIMEOUT = int(os.getenv("CANDIDATE_ANALYSIS_TIMEOUT", "55"))
+DISCOVERY_STAGE_TIMEOUT = int(os.getenv("DISCOVERY_STAGE_TIMEOUT", "70"))
 SOLANA_DIRECT_LIMIT = int(os.getenv("SOLANA_DIRECT_LIMIT", "25"))
 SOLANA_DIRECT_TTL_SECONDS = int(os.getenv("SOLANA_DIRECT_TTL_SECONDS", "900"))
 solana_direct_signatures = {}
@@ -1271,7 +1274,7 @@ async def solana_rpc_with_fallback(session, method, params):
             for attempt in range(2):
                 payload = {"jsonrpc":"2.0","id":1,"method":method,"params":params}
                 try:
-                    async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=18)) as response:
+                    async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=RPC_CALL_TIMEOUT)) as response:
                         if response.status != 200:
                             errors.append(f"{method}:HTTP {response.status}")
                             if response.status == 429 and attempt == 0:
@@ -1325,6 +1328,8 @@ async def solana_early_buyers(session, candidate):
         return result
 
     signature_infos.sort(key=lambda x: x.get("blockTime") or 0)
+    # Watchdog: inspect only the earliest bounded set; one hot token must not stall the scan.
+    signature_infos = signature_infos[:SOLANA_SIGNATURE_LIMIT]
     found = {}
     for signature_info in signature_infos:
         signature = signature_info.get("signature")
@@ -1575,89 +1580,81 @@ async def analyze_candidate(
 # SCAN
 # ============================================================
 
-async def perform_scan():
+async def perform_scan(progress=None):
 
     global last_scan_cache
-    raw, diagnostics = await discover_candidates()
+    stage_diag = {"stage": "discovery", "candidate_timeouts": 0, "candidate_errors": 0}
+
+    async def report(label):
+        stage_diag["stage"] = label
+        print("[SCAN STAGE]", label)
+        if progress:
+            try:
+                await progress(label)
+            except Exception as exc:
+                print("[SCAN PROGRESS ERROR]", type(exc).__name__, str(exc))
+
+    await report("Discovery läuft")
+    try:
+        raw, diagnostics = await asyncio.wait_for(discover_candidates(), timeout=DISCOVERY_STAGE_TIMEOUT)
+    except asyncio.TimeoutError:
+        raw, diagnostics = [], {"discovery_sources": [f"watchdog=timeout:{DISCOVERY_STAGE_TIMEOUT}s"]}
+        stage_diag["stage"] = "discovery_timeout"
+
+    diagnostics = diagnostics or {}
+    diagnostics["watchdog"] = stage_diag
+    await report(f"Discovery fertig: {len(raw)} Markt-Kandidaten")
 
     if not raw:
-
-        return {
-            "checked": 0,
-            "analyzed": 0,
-            "candidates": [],
-            "diagnostics": diagnostics,
-        }
+        return {"checked": 0, "analyzed": 0, "candidates": [], "diagnostics": diagnostics}
 
     analyzed = []
     buyer_diag = {"rejected_no_buyers": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0}
 
-    for candidate in raw:
-
+    for idx, candidate in enumerate(raw, 1):
+        await report(f"Buyer-Analyse {idx}/{len(raw)}")
         try:
-
-            result = (
-                await analyze_candidate(
-                    candidate
-                )
-            )
-
-            # Hard gate: never label a token TOP-EARLY without buyer evidence.
-            eb = result.get("early_buyers", {}) or {}
-            bc = int(eb.get("buyer_count", 0) or 0)
-            buyer_diag["signatures"] += int(eb.get("signatures_found", 0) or 0)
-            buyer_diag["transactions"] += int(eb.get("transactions_parsed", 0) or 0)
-            errs = eb.get("rpc_errors", []) or []
-            buyer_diag["rpc_errors"] += len(errs)
-            buyer_diag["rpc_429"] += sum("HTTP 429" in e for e in errs)
-            buyer_diag["rpc_timeout"] += sum("timeout" in e.lower() for e in errs)
-            buyer_diag["sig_errors"] += sum("getSignaturesForAddress" in e for e in errs)
-            buyer_diag["tx_errors"] += sum("getTransaction" in e for e in errs)
-            if bc < 2:
-                buyer_diag["rejected_no_buyers"] += 1
-                continue
-            if result["score"] >= ALERT_SCORE:
-                analyzed.append(result)
-
+            result = await asyncio.wait_for(analyze_candidate(candidate), timeout=CANDIDATE_ANALYSIS_TIMEOUT)
+        except asyncio.TimeoutError:
+            stage_diag["candidate_timeouts"] += 1
+            print("[CANDIDATE WATCHDOG] timeout", candidate.get("symbol") or candidate.get("name"))
+            continue
         except Exception as e:
+            stage_diag["candidate_errors"] += 1
+            print("[ANALYZE ERROR]", type(e).__name__, str(e))
+            continue
 
-            print(
-                "[ANALYZE ERROR]",
-                type(e).__name__,
-                str(e)
-            )
+        eb = result.get("early_buyers", {}) or {}
+        bc = int(eb.get("buyer_count", 0) or 0)
+        buyer_diag["signatures"] += int(eb.get("signatures_found", 0) or 0)
+        buyer_diag["transactions"] += int(eb.get("transactions_parsed", 0) or 0)
+        errs = eb.get("rpc_errors", []) or []
+        buyer_diag["rpc_errors"] += len(errs)
+        buyer_diag["rpc_429"] += sum("HTTP 429" in e for e in errs)
+        buyer_diag["rpc_timeout"] += sum("timeout" in e.lower() for e in errs)
+        buyer_diag["sig_errors"] += sum("getSignaturesForAddress" in e for e in errs)
+        buyer_diag["tx_errors"] += sum("getTransaction" in e for e in errs)
+        if bc < 2:
+            buyer_diag["rejected_no_buyers"] += 1
+            continue
+        if result["score"] >= ALERT_SCORE:
+            analyzed.append(result)
 
-    analyzed.sort(
-        key=lambda x: (
-            x["score"],
-            x["early_buyers"][
-                "buyer_count"
-            ],
-            -x["age_hours"]
-        ),
-        reverse=True
-    )
-
-    # FINAL POSTCONDITION: rebuild the output list from verified evidence only.
-    # This is deliberately separate from the loop above so a stale/pre-gate list
-    # can never leak into Telegram or the background alert loop.
+    analyzed.sort(key=lambda x: (x["score"], x["early_buyers"]["buyer_count"], -x["age_hours"]), reverse=True)
     verified = []
     for item in analyzed:
         eb = item.get("early_buyers") or {}
         buyers = eb.get("buyers") or []
         buyer_count = int(eb.get("buyer_count", 0) or 0)
         unique_wallets = {str(b.get("wallet", "")).strip() for b in buyers if isinstance(b, dict) and str(b.get("wallet", "")).strip()}
-        # Require both the reported count and at least two concrete unique wallets.
         if buyer_count >= 2 and len(unique_wallets) >= 2:
             verified.append(item)
 
+    await report("Auswertung fertig")
+    diagnostics["buyer_diag"] = buyer_diag
+    diagnostics["watchdog"] = stage_diag
     last_scan_cache = verified[:10]
-    return {
-        "checked": len(raw),
-        "analyzed": len(raw),
-        "candidates": verified[:5],
-        "diagnostics": {**diagnostics, "buyer_diag": buyer_diag},
-    }
+    return {"checked": len(raw), "analyzed": len(raw), "candidates": verified[:5], "diagnostics": diagnostics}
 
 
 # ============================================================
@@ -1923,6 +1920,7 @@ def format_diagnostics(stats):
         f"↳ 429: {stats.get('buyer_diag', {}).get('rpc_429', 0)} | Timeouts: {stats.get('buyer_diag', {}).get('rpc_timeout', 0)}\n"
         f"↳ Signatur-Fehler: {stats.get('buyer_diag', {}).get('sig_errors', 0)} | TX-Fehler: {stats.get('buyer_diag', {}).get('tx_errors', 0)}\n"
         f"Ohne ≥2 Buyer verworfen: {stats.get('buyer_diag', {}).get('rejected_no_buyers', 0)}"
+        + f"\n⏱ Watchdog: Stage={stats.get('watchdog', {}).get('stage', '-')} | Kandidaten-Timeouts={stats.get('watchdog', {}).get('candidate_timeouts', 0)} | Fehler={stats.get('watchdog', {}).get('candidate_errors', 0)}"
     )
 
 
@@ -1949,13 +1947,20 @@ async def _send_scan_result(message, result):
 
 
 async def _manual_scan_worker(message):
+    last_progress = {"text": None}
+    async def progress(stage):
+        # Print every stage to Render; Telegram only receives meaningful checkpoints.
+        print("[MANUAL SCAN]", stage)
+        if stage.startswith("Discovery fertig") or stage == "Auswertung fertig":
+            last_progress["text"] = stage
+            await message.reply_text("⏳ " + stage, read_timeout=30, write_timeout=30, connect_timeout=15, pool_timeout=15)
     try:
         async with scan_lock:
-            result = await asyncio.wait_for(perform_scan(), timeout=240)
+            result = await asyncio.wait_for(perform_scan(progress=progress), timeout=210)
         await _send_scan_result(message, result)
     except asyncio.TimeoutError:
         try:
-            await message.reply_text("⚠️ Scan nach 4 Minuten abgebrochen. Der Bot bleibt aktiv; bitte später erneut /scan senden.", read_timeout=45, write_timeout=45, connect_timeout=20, pool_timeout=20)
+            await message.reply_text("⚠️ Scan-Watchdog nach 3,5 Minuten abgebrochen. Der Bot bleibt aktiv; bitte später erneut /scan senden.", read_timeout=45, write_timeout=45, connect_timeout=20, pool_timeout=20)
         except Exception as exc:
             print("[SCAN TIMEOUT SEND ERROR]", type(exc).__name__, str(exc))
     except Exception as exc:

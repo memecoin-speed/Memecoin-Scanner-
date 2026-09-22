@@ -27,3 +27,14 @@ Use `/start` after deployment and verify `Version: 3.3.9-pro-buyer-gate`, then r
 - Token-pair enrichment cache so temporary 429 responses do not instantly erase direct Solana discovery.
 - Solana RPC concurrency limit and retry/backoff with stage-specific error counters.
 - Final TOP-EARLY output remains impossible without at least 2 concrete unique buyer wallets.
+
+## v3.4.3 Pro Watchdog
+- harte Timeouts pro Solana-RPC-Aufruf (Standard 10s)
+- Discovery-Watchdog (Standard 70s)
+- Kandidaten-Watchdog (Standard 55s)
+- begrenzte Solana-Transaktionsanalyse pro Kandidat
+- Fortschritts-Checkpoints im manuellen Telegram-Scan
+- zusätzliche Watchdog-Diagnose im Scan-Ergebnis
+- striktes Early-Buyer-Gate (mindestens 2 konkrete unterschiedliche Wallets) bleibt aktiv
+
+Optionale Environment-Variablen: `RPC_CALL_TIMEOUT`, `CANDIDATE_ANALYSIS_TIMEOUT`, `DISCOVERY_STAGE_TIMEOUT`, `SOLANA_SIGNATURE_LIMIT`.
