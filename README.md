@@ -21,3 +21,9 @@ Use `/start` after deployment and verify `Version: 3.3.9-pro-buyer-gate`, then r
 - Manual and automatic scans are serialized to avoid RPC request storms.
 - Telegram HTTP timeouts are increased and scan execution has a 4-minute ceiling.
 - The strict >=2 verified buyer-wallet gate remains enabled.
+
+## v3.4.2 resilience
+- DexScreener retry/backoff plus 15-minute successful-response cache.
+- Token-pair enrichment cache so temporary 429 responses do not instantly erase direct Solana discovery.
+- Solana RPC concurrency limit and retry/backoff with stage-specific error counters.
+- Final TOP-EARLY output remains impossible without at least 2 concrete unique buyer wallets.

@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.4.1-pro-stability"
+APP_VERSION = "3.4.2-pro-resilient-discovery"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -78,6 +78,13 @@ scan_trigger = asyncio.Event()
 last_scan_cache = []
 scan_lock = asyncio.Lock()
 manual_scan_tasks = set()
+
+# Resilience caches: a temporary HTTP 429 must not erase otherwise usable discovery.
+DISCOVERY_CACHE_TTL = int(os.getenv("DISCOVERY_CACHE_TTL", "900"))
+PAIR_CACHE_TTL = int(os.getenv("PAIR_CACHE_TTL", "900"))
+discovery_feed_cache = {}
+token_pair_cache = {}
+solana_rpc_semaphore = asyncio.Semaphore(int(os.getenv("SOLANA_RPC_CONCURRENCY", "3")))
 
 
 # ============================================================
@@ -384,24 +391,29 @@ async def rpc_call(
 # ============================================================
 
 async def get_discovery_feed(session, path):
-    """Fetch a DexScreener discovery feed and preserve an error label."""
+    """Fetch DexScreener with retry/backoff and stale-cache fallback on rate limits."""
     url = f"https://api.dexscreener.com/{path}"
-    try:
-        async with session.get(
-            url,
-            timeout=aiohttp.ClientTimeout(total=20),
-            headers={"User-Agent": f"MemecoinScanner/{APP_VERSION}", "Accept": "application/json"},
-        ) as response:
-            if response.status != 200:
-                return [], f"HTTP {response.status}"
-            data = await response.json(content_type=None)
-            if isinstance(data, list):
-                return data, None
-            if isinstance(data, dict):
-                return data.get("tokens", []) or data.get("pairs", []) or [], None
-            return [], "unexpected response"
-    except Exception as exc:
-        return [], f"{type(exc).__name__}: {str(exc)[:80]}"
+    error = None
+    for attempt in range(3):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20),
+                headers={"User-Agent": f"MemecoinScanner/{APP_VERSION}", "Accept": "application/json"}) as response:
+                if response.status == 200:
+                    data = await response.json(content_type=None)
+                    if isinstance(data, list): items = data
+                    elif isinstance(data, dict): items = data.get("tokens", []) or data.get("pairs", []) or []
+                    else: items = []
+                    discovery_feed_cache[path] = (time.time(), items)
+                    return items, None
+                error = f"HTTP {response.status}"
+                if response.status != 429: break
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {str(exc)[:80]}"
+        await asyncio.sleep(1.5 * (attempt + 1))
+    cached = discovery_feed_cache.get(path)
+    if cached and time.time() - cached[0] <= DISCOVERY_CACHE_TTL:
+        return cached[1], f"{error or 'error'} -> cache:{len(cached[1])}"
+    return [], error or "request failed"
 
 
 async def get_latest_profiles(session):
@@ -479,32 +491,28 @@ async def get_gecko_new_pools(session, network, chain):
     return out, f"ok:{len(out)}"
 
 
-async def get_token_pairs(
-    session,
-    chain,
-    address
-):
-
-    url = (
-        "https://api.dexscreener.com/"
-        f"token-pairs/v1/{chain}/{address}"
-    )
-
-    data = await http_get_json(
-        session,
-        url
-    )
-
-    if not data:
-        return []
-
-    if isinstance(data, list):
-        return data
-
-    return data.get(
-        "pairs",
-        []
-    )
+async def get_token_pairs(session, chain, address):
+    """DexScreener enrichment with bounded retry and per-token cache fallback."""
+    key = (str(chain).lower(), str(address).lower())
+    url = f"https://api.dexscreener.com/token-pairs/v1/{chain}/{address}"
+    for attempt in range(2):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=18),
+                headers={"User-Agent": f"MemecoinScanner/{APP_VERSION}", "Accept": "application/json"}) as response:
+                if response.status == 200:
+                    data = await response.json(content_type=None)
+                    pairs = data if isinstance(data, list) else (data.get("pairs", []) if isinstance(data, dict) else [])
+                    if pairs:
+                        token_pair_cache[key] = (time.time(), pairs)
+                    return pairs
+                if response.status != 429: break
+        except Exception:
+            pass
+        await asyncio.sleep(1.0 * (attempt + 1))
+    cached = token_pair_cache.get(key)
+    if cached and time.time() - cached[0] <= PAIR_CACHE_TTL:
+        return cached[1]
+    return []
 
 
 MEME_TERMS = {
@@ -1253,27 +1261,33 @@ def token_balance_map(
 
 
 async def solana_rpc_with_fallback(session, method, params):
-    """Try the configured Solana RPC first, then fallbacks; return diagnostics."""
+    """Bounded Solana RPC with one retry per endpoint and explicit diagnostics."""
     urls = []
     for url in [SOLANA_RPC] + SOLANA_RPC_FALLBACKS:
-        if url and url not in urls:
-            urls.append(url)
+        if url and url not in urls: urls.append(url)
     errors = []
-    for url in urls:
-        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        try:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=20)) as response:
-                if response.status != 200:
-                    errors.append(f"{url}:HTTP {response.status}")
-                    continue
-                data = await response.json(content_type=None)
-                if data.get("error"):
-                    err = data["error"]
-                    errors.append(f"{url}:RPC {err.get('code')} {str(err.get('message',''))[:60]}")
-                    continue
-                return data.get("result"), url, errors
-        except Exception as exc:
-            errors.append(f"{url}:{type(exc).__name__}")
+    async with solana_rpc_semaphore:
+        for url in urls:
+            for attempt in range(2):
+                payload = {"jsonrpc":"2.0","id":1,"method":method,"params":params}
+                try:
+                    async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=18)) as response:
+                        if response.status != 200:
+                            errors.append(f"{method}:HTTP {response.status}")
+                            if response.status == 429 and attempt == 0:
+                                await asyncio.sleep(0.8)
+                                continue
+                            break
+                        data = await response.json(content_type=None)
+                        if data.get("error"):
+                            err=data["error"]; errors.append(f"{method}:RPC {err.get('code')}")
+                            break
+                        return data.get("result"), url, errors
+                except asyncio.TimeoutError:
+                    errors.append(f"{method}:timeout")
+                except Exception as exc:
+                    errors.append(f"{method}:{type(exc).__name__}")
+                if attempt == 0: await asyncio.sleep(0.5)
     return None, None, errors
 
 
@@ -1576,7 +1590,7 @@ async def perform_scan():
         }
 
     analyzed = []
-    buyer_diag = {"rejected_no_buyers": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0}
+    buyer_diag = {"rejected_no_buyers": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0}
 
     for candidate in raw:
 
@@ -1593,7 +1607,12 @@ async def perform_scan():
             bc = int(eb.get("buyer_count", 0) or 0)
             buyer_diag["signatures"] += int(eb.get("signatures_found", 0) or 0)
             buyer_diag["transactions"] += int(eb.get("transactions_parsed", 0) or 0)
-            buyer_diag["rpc_errors"] += len(eb.get("rpc_errors", []) or [])
+            errs = eb.get("rpc_errors", []) or []
+            buyer_diag["rpc_errors"] += len(errs)
+            buyer_diag["rpc_429"] += sum("HTTP 429" in e for e in errs)
+            buyer_diag["rpc_timeout"] += sum("timeout" in e.lower() for e in errs)
+            buyer_diag["sig_errors"] += sum("getSignaturesForAddress" in e for e in errs)
+            buyer_diag["tx_errors"] += sum("getTransaction" in e for e in errs)
             if bc < 2:
                 buyer_diag["rejected_no_buyers"] += 1
                 continue
@@ -1757,6 +1776,10 @@ def format_candidate(
     index,
     candidate
 ):
+    eb = candidate.get("early_buyers") or {}
+    wallets = {str(b.get("wallet", "")).strip() for b in (eb.get("buyers") or []) if isinstance(b, dict) and str(b.get("wallet", "")).strip()}
+    if int(eb.get("buyer_count", 0) or 0) < 2 or len(wallets) < 2:
+        raise ValueError("unverified candidate blocked from TOP-EARLY output")
 
     age = candidate[
         "age_hours"
@@ -1897,6 +1920,8 @@ def format_diagnostics(stats):
         f"Signaturen geprüft: {stats.get('buyer_diag', {}).get('signatures', 0)}\n"
         f"Transaktionen geparst: {stats.get('buyer_diag', {}).get('transactions', 0)}\n"
         f"RPC-Fehler: {stats.get('buyer_diag', {}).get('rpc_errors', 0)}\n"
+        f"↳ 429: {stats.get('buyer_diag', {}).get('rpc_429', 0)} | Timeouts: {stats.get('buyer_diag', {}).get('rpc_timeout', 0)}\n"
+        f"↳ Signatur-Fehler: {stats.get('buyer_diag', {}).get('sig_errors', 0)} | TX-Fehler: {stats.get('buyer_diag', {}).get('tx_errors', 0)}\n"
         f"Ohne ≥2 Buyer verworfen: {stats.get('buyer_diag', {}).get('rejected_no_buyers', 0)}"
     )
 
