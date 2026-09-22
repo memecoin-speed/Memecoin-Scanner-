@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.3.4-pro-multisource"
+APP_VERSION = "3.3.5-pro-fallback"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -402,23 +402,15 @@ async def get_latest_profiles(session):
 
 
 async def get_discovery_profiles(session):
-    # Profiles can occasionally be empty/unreachable from a hosting provider.
-    # Merge independent DexScreener feeds so one endpoint cannot zero the scanner.
+    # DexScreener is enrichment only. Calls are sequential to avoid burst 429s.
     feeds = [
         ("profiles", "token-profiles/latest/v1"),
         ("boosts_latest", "token-boosts/latest/v1"),
         ("boosts_top", "token-boosts/top/v1"),
     ]
-    results = await asyncio.gather(
-        *(get_discovery_feed(session, path) for _, path in feeds),
-        return_exceptions=True,
-    )
     merged, seen, health = [], set(), {}
-    for (name, _), result in zip(feeds, results):
-        if isinstance(result, Exception):
-            health[name] = f"{type(result).__name__}"
-            continue
-        items, error = result
+    for name, path in feeds:
+        items, error = await get_discovery_feed(session, path)
         health[name] = error or f"ok:{len(items)}"
         for item in items:
             chain = (item.get("chainId") or "").lower()
@@ -427,9 +419,56 @@ async def get_discovery_profiles(session):
                 continue
             key = (chain, address.lower())
             if key not in seen:
-                seen.add(key)
-                merged.append(item)
+                seen.add(key); merged.append(item)
+        # Be polite to the public endpoint and avoid three simultaneous requests.
+        await asyncio.sleep(1.0)
     return merged, health
+
+
+def _gecko_token_id_to_address(token_id):
+    if not token_id: return None
+    return token_id.split("_", 1)[1] if "_" in token_id else token_id
+
+
+async def get_gecko_new_pools(session, network, chain):
+    """Independent discovery fallback. Returns DexScreener-shaped pairs."""
+    url = f"https://api.geckoterminal.com/api/v2/networks/{network}/new_pools?page=1&include=base_token"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=20), headers={"Accept":"application/json","User-Agent":f"MemecoinScanner/{APP_VERSION}"}) as r:
+            if r.status != 200:
+                return [], f"HTTP {r.status}"
+            payload = await r.json(content_type=None)
+    except Exception as exc:
+        return [], f"{type(exc).__name__}: {str(exc)[:70]}"
+    included = {}
+    for item in payload.get("included", []) if isinstance(payload, dict) else []:
+        a = item.get("attributes") or {}
+        included[item.get("id")] = a
+    out = []
+    for item in payload.get("data", []) if isinstance(payload, dict) else []:
+        a = item.get("attributes") or {}; rel = item.get("relationships") or {}
+        base_id = (((rel.get("base_token") or {}).get("data") or {}).get("id"))
+        tok = included.get(base_id, {})
+        token_address = tok.get("address") or _gecko_token_id_to_address(base_id)
+        pair_address = a.get("address") or item.get("id")
+        if not token_address or not pair_address: continue
+        created_ms = None
+        created = a.get("pool_created_at")
+        if created:
+            try: created_ms = int(datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()*1000)
+            except Exception: pass
+        tx = (a.get("transactions") or {}).get("h24") or {}
+        vol = (a.get("volume_usd") or {}).get("h24") or 0
+        pc = (a.get("price_change_percentage") or {}).get("h24") or 0
+        out.append({
+            "chainId": chain, "pairAddress": pair_address,
+            "baseToken": {"address": token_address, "name": tok.get("name") or a.get("name") or "Unknown", "symbol": tok.get("symbol") or "UNKNOWN"},
+            "liquidity": {"usd": a.get("reserve_in_usd") or 0}, "volume": {"h24": vol},
+            "txns": {"h24": {"buys": tx.get("buys",0), "sells": tx.get("sells",0)}},
+            "priceChange": {"h24": pc}, "pairCreatedAt": created_ms,
+            "url": f"https://www.geckoterminal.com/{network}/pools/{pair_address}", "discoverySource":"geckoterminal"
+        })
+    return out, f"ok:{len(out)}"
 
 
 async def get_token_pairs(
@@ -518,23 +557,29 @@ async def discover_candidates():
     }
 
     async with aiohttp.ClientSession() as session:
+        # Independent primary fallback: GeckoTerminal new pools (no DexScreener dependency).
+        sol_gt, sol_health = await get_gecko_new_pools(session, "solana", "solana")
+        eth_gt, eth_health = await get_gecko_new_pools(session, "eth", "ethereum")
         profiles, source_health = await get_discovery_profiles(session)
+        source_health["gecko_solana"] = sol_health
+        source_health["gecko_ethereum"] = eth_health
         stats["source_health"] = source_health
-        if not profiles:
-            return [], stats
-
-        profiles = profiles[:150]
         stats["profiles"] = len(profiles)
-        tasks = []
-        for profile in profiles:
-            chain = profile.get("chainId")
-            address = profile.get("tokenAddress")
-            if not chain or not address:
-                stats["missing_data"] += 1
-                continue
-            tasks.append(get_token_pairs(session, chain, address))
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Gecko pairs can be filtered immediately. DexScreener profiles are enriched
+        # conservatively and only when available, preventing 429 from zeroing scans.
+        results = [[p] for p in (sol_gt + eth_gt)]
+        profiles = profiles[:30]
+        for profile in profiles:
+            chain = profile.get("chainId"); address = profile.get("tokenAddress")
+            if not chain or not address:
+                stats["missing_data"] += 1; continue
+            try:
+                pairs = await get_token_pairs(session, chain, address)
+                results.append(pairs)
+            except Exception:
+                stats["pair_errors"] += 1
+            await asyncio.sleep(0.35)
         stats["pair_responses"] = len(results)
 
         for pairs in results:
