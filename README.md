@@ -40,3 +40,6 @@ Für zuverlässige und schnelle On-Chain-Erkennung ist ein eigener Solana-RPC/We
 ## Sicherheit
 
 Der Bot führt **keine echten Käufe** aus und benötigt **keinen Private Key**. `/buy`/Paper-Buy arbeitet nur mit simulierten Einträgen in SQLite. Memecoins bleiben hochriskant; Score und Risk-Check sind Signale, keine Garantie.
+
+## v3.3.3 Pro Diagnostics
+`/scan` now reports the discovery funnel (profiles, SOL/ETH pairs, filter rejection reasons, API/pair errors, and passed pairs) so a `Geprüft: 0` result can be diagnosed directly in Telegram.

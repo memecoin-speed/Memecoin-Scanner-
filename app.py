@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.3.2-pro"
+APP_VERSION = "3.3.3-pro-diagnostics"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -476,285 +476,96 @@ def meme_signal(
 async def discover_candidates():
 
     candidates = []
+    stats = {
+        "profiles": 0, "pair_responses": 0, "pairs": 0,
+        "solana_pairs": 0, "ethereum_pairs": 0, "unsupported_chain": 0,
+        "missing_data": 0, "blocked": 0, "age_missing": 0,
+        "too_new": 0, "too_old": 0, "liq_low": 0, "liq_high": 0,
+        "vol_low": 0, "vol_high": 0, "txns_low": 0,
+        "price_change_high": 0, "meme_filter": 0, "passed": 0,
+        "pair_errors": 0,
+    }
 
     async with aiohttp.ClientSession() as session:
-
-        profiles = await get_latest_profiles(
-            session
-        )
-
+        profiles = await get_latest_profiles(session)
         if not profiles:
-            return []
+            return [], stats
 
         profiles = profiles[:100]
-
+        stats["profiles"] = len(profiles)
         tasks = []
-
         for profile in profiles:
-
-            chain = profile.get(
-                "chainId"
-            )
-
-            address = profile.get(
-                "tokenAddress"
-            )
-
+            chain = profile.get("chainId")
+            address = profile.get("tokenAddress")
             if not chain or not address:
+                stats["missing_data"] += 1
                 continue
+            tasks.append(get_token_pairs(session, chain, address))
 
-            tasks.append(
-                get_token_pairs(
-                    session,
-                    chain,
-                    address
-                )
-            )
-
-        results = await asyncio.gather(
-            *tasks,
-            return_exceptions=True
-        )
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        stats["pair_responses"] = len(results)
 
         for pairs in results:
-
-            if isinstance(
-                pairs,
-                Exception
-            ):
+            if isinstance(pairs, Exception):
+                stats["pair_errors"] += 1
                 continue
-
             for pair in pairs:
-
+                stats["pairs"] += 1
                 try:
-
-                    chain = pair.get(
-                        "chainId"
-                    )
-
-                    pair_address = pair.get(
-                        "pairAddress"
-                    )
-
-                    base = (
-                        pair.get(
-                            "baseToken"
-                        )
-                        or {}
-                    )
-
-                    name = base.get(
-                        "name",
-                        "Unknown"
-                    )
-
-                    symbol = base.get(
-                        "symbol",
-                        "UNKNOWN"
-                    )
-
-                    token_address = (
-                        base.get(
-                            "address"
-                        )
-                    )
-
-                    if not chain:
+                    chain = (pair.get("chainId") or "").lower()
+                    if chain == "solana": stats["solana_pairs"] += 1
+                    elif chain == "ethereum": stats["ethereum_pairs"] += 1
+                    else:
+                        stats["unsupported_chain"] += 1
                         continue
 
-                    if not pair_address:
-                        continue
+                    pair_address = pair.get("pairAddress")
+                    base = pair.get("baseToken") or {}
+                    name = base.get("name", "Unknown")
+                    symbol = base.get("symbol", "UNKNOWN")
+                    token_address = base.get("address")
+                    if not chain or not pair_address or not token_address:
+                        stats["missing_data"] += 1; continue
+                    if is_blocked_token(symbol, name):
+                        stats["blocked"] += 1; continue
 
-                    if not token_address:
-                        continue
+                    liquidity = clean_number((pair.get("liquidity") or {}).get("usd"))
+                    volume = clean_number((pair.get("volume") or {}).get("h24"))
+                    txns_24h = ((pair.get("txns") or {}).get("h24") or {})
+                    buys = int(clean_number(txns_24h.get("buys")))
+                    sells = int(clean_number(txns_24h.get("sells")))
+                    total_txns = buys + sells
+                    price_change = clean_number((pair.get("priceChange") or {}).get("h24"))
+                    age_hours = pair_age_hours(pair)
 
-                    if is_blocked_token(
-                        symbol,
-                        name
-                    ):
-                        continue
-
-                    liquidity = clean_number(
-                        (
-                            pair.get(
-                                "liquidity"
-                            )
-                            or {}
-                        ).get(
-                            "usd"
-                        )
-                    )
-
-                    volume = clean_number(
-                        (
-                            pair.get(
-                                "volume"
-                            )
-                            or {}
-                        ).get(
-                            "h24"
-                        )
-                    )
-
-                    txns = (
-                        pair.get(
-                            "txns"
-                        )
-                        or {}
-                    )
-
-                    txns_24h = (
-                        txns.get(
-                            "h24"
-                        )
-                        or {}
-                    )
-
-                    buys = int(
-                        clean_number(
-                            txns_24h.get(
-                                "buys"
-                            )
-                        )
-                    )
-
-                    sells = int(
-                        clean_number(
-                            txns_24h.get(
-                                "sells"
-                            )
-                        )
-                    )
-
-                    total_txns = (
-                        buys + sells
-                    )
-
-                    price_change = clean_number(
-                        (
-                            pair.get(
-                                "priceChange"
-                            )
-                            or {}
-                        ).get(
-                            "h24"
-                        )
-                    )
-
-                    age_hours = (
-                        pair_age_hours(
-                            pair
-                        )
-                    )
-
-                    if age_hours is None:
-                        continue
-
-                    if (
-                        age_hours * 60
-                        < MIN_PAIR_AGE_MINUTES
-                    ):
-                        continue
-
-                    if (
-                        age_hours
-                        > MAX_PAIR_AGE_HOURS
-                    ):
-                        continue
-
-                    if (
-                        liquidity
-                        < MIN_LIQUIDITY_USD
-                    ):
-                        continue
-
-                    if (
-                        liquidity
-                        > MAX_LIQUIDITY_USD
-                    ):
-                        continue
-
-                    if (
-                        volume
-                        < MIN_VOLUME_24H
-                    ):
-                        continue
-
-                    if (
-                        volume
-                        > MAX_VOLUME_24H
-                    ):
-                        continue
-
-                    if (
-                        total_txns
-                        < MIN_TXNS_24H
-                    ):
-                        continue
-
-                    if (
-                        price_change
-                        > MAX_PRICE_CHANGE_24H
-                    ):
-                        continue
-
-                    if not meme_signal(
-                        name,
-                        symbol
-                    ):
-                        continue
+                    if age_hours is None: stats["age_missing"] += 1; continue
+                    if age_hours * 60 < MIN_PAIR_AGE_MINUTES: stats["too_new"] += 1; continue
+                    if age_hours > MAX_PAIR_AGE_HOURS: stats["too_old"] += 1; continue
+                    if liquidity < MIN_LIQUIDITY_USD: stats["liq_low"] += 1; continue
+                    if liquidity > MAX_LIQUIDITY_USD: stats["liq_high"] += 1; continue
+                    if volume < MIN_VOLUME_24H: stats["vol_low"] += 1; continue
+                    if volume > MAX_VOLUME_24H: stats["vol_high"] += 1; continue
+                    if total_txns < MIN_TXNS_24H: stats["txns_low"] += 1; continue
+                    if price_change > MAX_PRICE_CHANGE_24H: stats["price_change_high"] += 1; continue
+                    if not meme_signal(name, symbol): stats["meme_filter"] += 1; continue
 
                     candidates.append({
-                        "chain": chain,
-                        "address": token_address,
-                        "pair_address":
-                            pair_address,
-                        "name": name,
-                        "symbol": symbol,
-                        "liquidity":
-                            liquidity,
-                        "volume":
-                            volume,
-                        "buys":
-                            buys,
-                        "sells":
-                            sells,
-                        "txns":
-                            total_txns,
-                        "price_change":
-                            price_change,
-                        "age_hours":
-                            age_hours,
-                        "price_usd":
-                            clean_number(
-                                pair.get(
-                                    "priceUsd"
-                                )
-                            ),
-                        "url":
-                            pair.get(
-                                "url"
-                            ),
+                        "chain": chain, "address": token_address, "pair_address": pair_address,
+                        "name": name, "symbol": symbol, "liquidity": liquidity,
+                        "volume": volume, "buys": buys, "sells": sells, "txns": total_txns,
+                        "price_change": price_change, "age_hours": age_hours,
+                        "price_usd": clean_number(pair.get("priceUsd")), "url": pair.get("url"),
                     })
-
+                    stats["passed"] += 1
                 except Exception:
-                    continue
+                    stats["pair_errors"] += 1
 
     unique = {}
-
     for candidate in candidates:
-
-        key = (
-            candidate["chain"],
-            candidate["pair_address"]
-        )
-
-        if key not in unique:
-            unique[key] = candidate
-
-    return list(
-        unique.values()
-    )
+        key = (candidate["chain"], candidate["pair_address"])
+        if key not in unique: unique[key] = candidate
+    stats["passed_unique"] = len(unique)
+    return list(unique.values()), stats
 
 
 # ============================================================
@@ -1613,13 +1424,15 @@ async def analyze_candidate(
 async def perform_scan():
 
     global last_scan_cache
-    raw = await discover_candidates()
+    raw, diagnostics = await discover_candidates()
 
     if not raw:
 
         return {
             "checked": 0,
-            "candidates": []
+            "analyzed": 0,
+            "candidates": [],
+            "diagnostics": diagnostics,
         }
 
     analyzed = []
@@ -1664,7 +1477,9 @@ async def perform_scan():
     last_scan_cache = analyzed[:10]
     return {
         "checked": len(raw),
-        "candidates": analyzed[:5]
+        "analyzed": len(raw),
+        "candidates": analyzed[:5],
+        "diagnostics": diagnostics,
     }
 
 
@@ -1898,6 +1713,26 @@ async def status(
     )
 
 
+def format_diagnostics(stats):
+    return (
+        "\n\n🧪 Discovery-Diagnose:\n"
+        f"Profile geladen: {stats.get('profiles', 0)}\n"
+        f"Pairs gefunden: {stats.get('pairs', 0)} "
+        f"(SOL {stats.get('solana_pairs', 0)} | ETH {stats.get('ethereum_pairs', 0)})\n"
+        f"Andere Chains: {stats.get('unsupported_chain', 0)}\n"
+        f"Fehlende Daten/Alter: {stats.get('missing_data', 0) + stats.get('age_missing', 0)}\n"
+        f"Blockiert: {stats.get('blocked', 0)}\n"
+        f"Zu neu: {stats.get('too_new', 0)} | Zu alt: {stats.get('too_old', 0)}\n"
+        f"Liquidität zu niedrig/hoch: {stats.get('liq_low', 0)}/{stats.get('liq_high', 0)}\n"
+        f"Volumen zu niedrig/hoch: {stats.get('vol_low', 0)}/{stats.get('vol_high', 0)}\n"
+        f"Zu wenig Txns: {stats.get('txns_low', 0)}\n"
+        f"Preisanstieg-Filter: {stats.get('price_change_high', 0)}\n"
+        f"Meme-Filter: {stats.get('meme_filter', 0)}\n"
+        f"Pair/API-Fehler: {stats.get('pair_errors', 0)}\n"
+        f"Filter bestanden: {stats.get('passed_unique', stats.get('passed', 0))}"
+    )
+
+
 async def scan(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
@@ -1907,8 +1742,7 @@ async def scan(
         return
 
     await update.message.reply_text(
-        "🔎 Starte 3.3 "
-        "Early-Buyer-Analyse...\n\n"
+        f"🔎 Starte {APP_VERSION} Early-Buyer-Analyse...\n\n"
         "Ethereum + Solana werden "
         "on-chain geprüft."
     )
@@ -1923,6 +1757,9 @@ async def scan(
         "candidates"
     ]
 
+    diagnostics = result.get("diagnostics", {})
+    diagnostic_text = format_diagnostics(diagnostics)
+
     if not candidates:
 
         await update.message.reply_text(
@@ -1931,6 +1768,7 @@ async def scan(
             "🚨 Kandidaten: 0\n\n"
             "❌ Keine passenden "
             "Early-Kandidaten gefunden."
+            + diagnostic_text
         )
 
         return
@@ -1955,6 +1793,8 @@ async def scan(
             )
             + "\n\n"
         )
+
+    text += diagnostic_text
 
     await update.message.reply_text(
         text,
