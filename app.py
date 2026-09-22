@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.3.8-pro-buyer-debug"
+APP_VERSION = "3.3.9-pro-buyer-gate"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -1877,7 +1877,12 @@ def format_diagnostics(stats):
         f"Preisanstieg-Filter: {stats.get('price_change_high', 0)}\n"
         f"Meme-Filter: {stats.get('meme_filter', 0)}\n"
         f"Pair/API-Fehler: {stats.get('pair_errors', 0)}\n"
-        f"Filter bestanden: {stats.get('passed_unique', stats.get('passed', 0))}"
+        f"Filter bestanden: {stats.get('passed_unique', stats.get('passed', 0))}\n"
+        f"\n🔬 Buyer-Diagnose:\n"
+        f"Signaturen geprüft: {stats.get('buyer_diag', {}).get('signatures', 0)}\n"
+        f"Transaktionen geparst: {stats.get('buyer_diag', {}).get('transactions', 0)}\n"
+        f"RPC-Fehler: {stats.get('buyer_diag', {}).get('rpc_errors', 0)}\n"
+        f"Ohne ≥2 Buyer verworfen: {stats.get('buyer_diag', {}).get('rejected_no_buyers', 0)}"
     )
 
 
@@ -1903,6 +1908,13 @@ async def scan(
 
     candidates = result[
         "candidates"
+    ]
+
+    # Defense in depth: Telegram must never display a TOP-EARLY candidate
+    # unless at least two on-chain buyer wallets were actually verified.
+    candidates = [
+        c for c in candidates
+        if int((c.get("early_buyers") or {}).get("buyer_count", 0) or 0) >= 2
     ]
 
     diagnostics = result.get("diagnostics", {})
@@ -2121,7 +2133,9 @@ async def scanner_loop(
                 for candidate in candidates:
                     buyers = candidate["early_buyers"]["buyer_count"]
                     print("[CANDIDATE]", candidate["name"], candidate["symbol"], candidate["chain"], "Score=", candidate["score"], "EarlyBuyers=", buyers)
-                    if AUTO_ALERT and ALLOWED_CHAT_ID and alert_is_due(candidate):
+                    if (AUTO_ALERT and ALLOWED_CHAT_ID
+                            and int((candidate.get("early_buyers") or {}).get("buyer_count", 0) or 0) >= 2
+                            and alert_is_due(candidate)):
                         try:
                             await application.bot.send_message(
                                 chat_id=ALLOWED_CHAT_ID,
