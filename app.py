@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.3.3-pro-diagnostics"
+APP_VERSION = "3.3.4-pro-multisource"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -375,30 +375,61 @@ async def rpc_call(
 # DEXSCREENER
 # ============================================================
 
-async def get_latest_profiles(
-    session
-):
+async def get_discovery_feed(session, path):
+    """Fetch a DexScreener discovery feed and preserve an error label."""
+    url = f"https://api.dexscreener.com/{path}"
+    try:
+        async with session.get(
+            url,
+            timeout=aiohttp.ClientTimeout(total=20),
+            headers={"User-Agent": f"MemecoinScanner/{APP_VERSION}", "Accept": "application/json"},
+        ) as response:
+            if response.status != 200:
+                return [], f"HTTP {response.status}"
+            data = await response.json(content_type=None)
+            if isinstance(data, list):
+                return data, None
+            if isinstance(data, dict):
+                return data.get("tokens", []) or data.get("pairs", []) or [], None
+            return [], "unexpected response"
+    except Exception as exc:
+        return [], f"{type(exc).__name__}: {str(exc)[:80]}"
 
-    url = (
-        "https://api.dexscreener.com/"
-        "token-profiles/latest/v1"
+
+async def get_latest_profiles(session):
+    items, _ = await get_discovery_feed(session, "token-profiles/latest/v1")
+    return items
+
+
+async def get_discovery_profiles(session):
+    # Profiles can occasionally be empty/unreachable from a hosting provider.
+    # Merge independent DexScreener feeds so one endpoint cannot zero the scanner.
+    feeds = [
+        ("profiles", "token-profiles/latest/v1"),
+        ("boosts_latest", "token-boosts/latest/v1"),
+        ("boosts_top", "token-boosts/top/v1"),
+    ]
+    results = await asyncio.gather(
+        *(get_discovery_feed(session, path) for _, path in feeds),
+        return_exceptions=True,
     )
-
-    data = await http_get_json(
-        session,
-        url
-    )
-
-    if not data:
-        return []
-
-    if isinstance(data, list):
-        return data
-
-    return data.get(
-        "tokens",
-        []
-    )
+    merged, seen, health = [], set(), {}
+    for (name, _), result in zip(feeds, results):
+        if isinstance(result, Exception):
+            health[name] = f"{type(result).__name__}"
+            continue
+        items, error = result
+        health[name] = error or f"ok:{len(items)}"
+        for item in items:
+            chain = (item.get("chainId") or "").lower()
+            address = item.get("tokenAddress")
+            if chain not in {"solana", "ethereum"} or not address:
+                continue
+            key = (chain, address.lower())
+            if key not in seen:
+                seen.add(key)
+                merged.append(item)
+    return merged, health
 
 
 async def get_token_pairs(
@@ -487,11 +518,12 @@ async def discover_candidates():
     }
 
     async with aiohttp.ClientSession() as session:
-        profiles = await get_latest_profiles(session)
+        profiles, source_health = await get_discovery_profiles(session)
+        stats["source_health"] = source_health
         if not profiles:
             return [], stats
 
-        profiles = profiles[:100]
+        profiles = profiles[:150]
         stats["profiles"] = len(profiles)
         tasks = []
         for profile in profiles:
@@ -1716,6 +1748,7 @@ async def status(
 def format_diagnostics(stats):
     return (
         "\n\n🧪 Discovery-Diagnose:\n"
+        f"Discovery-Quellen: " + " | ".join(f"{k}={v}" for k, v in stats.get("source_health", {}).items()) + "\n"
         f"Profile geladen: {stats.get('profiles', 0)}\n"
         f"Pairs gefunden: {stats.get('pairs', 0)} "
         f"(SOL {stats.get('solana_pairs', 0)} | ETH {stats.get('ethereum_pairs', 0)})\n"
