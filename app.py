@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.4.4-pro-fast-discovery"
+APP_VERSION = "3.4.5-pro-persistent-cache"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -80,7 +80,8 @@ scan_lock = asyncio.Lock()
 manual_scan_tasks = set()
 
 # Resilience caches: a temporary HTTP 429 must not erase otherwise usable discovery.
-DISCOVERY_CACHE_TTL = int(os.getenv("DISCOVERY_CACHE_TTL", "900"))
+DISCOVERY_CACHE_TTL = int(os.getenv("DISCOVERY_CACHE_TTL", "3600"))
+PERSISTENT_PAIR_CACHE_TTL = int(os.getenv("PERSISTENT_PAIR_CACHE_TTL", "21600"))
 PAIR_CACHE_TTL = int(os.getenv("PAIR_CACHE_TTL", "900"))
 discovery_feed_cache = {}
 token_pair_cache = {}
@@ -106,7 +107,7 @@ EARLY_BUYER_WINDOW_HOURS = 24
 SOLANA_SIGNATURE_LIMIT = int(os.getenv("SOLANA_SIGNATURE_LIMIT", "20"))
 RPC_CALL_TIMEOUT = int(os.getenv("RPC_CALL_TIMEOUT", "6"))
 CANDIDATE_ANALYSIS_TIMEOUT = int(os.getenv("CANDIDATE_ANALYSIS_TIMEOUT", "28"))
-DISCOVERY_STAGE_TIMEOUT = int(os.getenv("DISCOVERY_STAGE_TIMEOUT", "38"))
+DISCOVERY_STAGE_TIMEOUT = int(os.getenv("DISCOVERY_STAGE_TIMEOUT", "24"))
 SOLANA_DIRECT_LIMIT = int(os.getenv("SOLANA_DIRECT_LIMIT", "25"))
 SOLANA_DIRECT_TTL_SECONDS = int(os.getenv("SOLANA_DIRECT_TTL_SECONDS", "900"))
 solana_direct_signatures = {}
@@ -213,9 +214,60 @@ def init_db():
         )
     """)
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS discovery_pair_cache (
+            cache_key TEXT PRIMARY KEY,
+            saved_at REAL NOT NULL,
+            pair_json TEXT NOT NULL
+        )
+    """)
+
     conn.commit()
     conn.close()
 
+
+
+def save_persistent_pairs(pairs):
+    """Persist successful discovery pairs so a temporary 429/timeout cannot zero the next scan."""
+    if not pairs:
+        return
+    conn = sqlite3.connect(DB_FILE)
+    now_ts = time.time()
+    try:
+        for pair in pairs:
+            if not isinstance(pair, dict):
+                continue
+            key = f"{(pair.get('chainId') or '').lower()}:{pair.get('pairAddress') or ''}"
+            if key == ":":
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO discovery_pair_cache(cache_key,saved_at,pair_json) VALUES(?,?,?)",
+                (key, now_ts, json.dumps(pair, separators=(",", ":")))
+            )
+        conn.execute("DELETE FROM discovery_pair_cache WHERE saved_at < ?", (now_ts - PERSISTENT_PAIR_CACHE_TTL,))
+        conn.commit()
+    finally:
+        conn.close()
+
+def load_persistent_pairs(limit=250):
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        rows = conn.execute(
+            "SELECT pair_json FROM discovery_pair_cache WHERE saved_at >= ? ORDER BY saved_at DESC LIMIT ?",
+            (time.time() - PERSISTENT_PAIR_CACHE_TTL, limit)
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+    out=[]
+    for (raw,) in rows:
+        try:
+            item=json.loads(raw)
+            if isinstance(item,dict): out.append(item)
+        except Exception:
+            pass
+    return out
 
 # ============================================================
 # BASIC HELPERS
@@ -632,10 +684,10 @@ async def discover_candidates():
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
         # Run independent sources concurrently. Direct Solana gets a tighter budget because
         # market feeds should still return quickly when a public RPC is slow.
-        gt_sol_t = asyncio.create_task(safe("gecko_solana", get_gecko_new_pools(session,"solana","solana"), 10, ([],"timeout")))
-        gt_eth_t = asyncio.create_task(safe("gecko_ethereum", get_gecko_new_pools(session,"eth","ethereum"), 10, ([],"timeout")))
-        dex_t = asyncio.create_task(safe("dex", get_discovery_profiles(session), 16, ([],{})))
-        direct_t = asyncio.create_task(safe("solana_direct", get_direct_solana_pairs(session), 18, ([],{"signatures":0,"mints":0,"pairs":0,"enrich429":0,"rpc":"timeout"})))
+        gt_sol_t = asyncio.create_task(safe("gecko_solana", get_gecko_new_pools(session,"solana","solana"), 7, ([],"timeout")))
+        gt_eth_t = asyncio.create_task(safe("gecko_ethereum", get_gecko_new_pools(session,"eth","ethereum"), 7, ([],"timeout")))
+        dex_t = asyncio.create_task(safe("dex", get_discovery_profiles(session), 10, ([],{})))
+        direct_t = asyncio.create_task(safe("solana_direct", get_direct_solana_pairs(session), 10, ([],{"signatures":0,"mints":0,"pairs":0,"enrich429":0,"rpc":"timeout"})))
 
         (sol_pack, sol_err), (eth_pack, eth_err), (dex_pack, dex_err), (direct_pack, direct_err) = await asyncio.gather(gt_sol_t, gt_eth_t, dex_t, direct_t)
         sol_gt, sol_health = sol_pack
@@ -650,13 +702,26 @@ async def discover_candidates():
         stats["source_health"] = source_health
         stats["profiles"] = len(profiles or [])
 
-        results = [[p] for p in ((direct_sol or []) + (sol_gt or []) + (eth_gt or []))]
+        live_pairs = (direct_sol or []) + (sol_gt or []) + (eth_gt or [])
+        if live_pairs:
+            save_persistent_pairs(live_pairs)
+        cached_pairs = load_persistent_pairs()
+        source_health["persistent_cache"] = f"loaded:{len(cached_pairs)}"
+        # Cache supplements live feeds and becomes the fallback when every public source is throttled.
+        merged_pairs = {}
+        for p in live_pairs + cached_pairs:
+            if not isinstance(p, dict):
+                continue
+            k = ((p.get("chainId") or "").lower(), p.get("pairAddress") or "")
+            if k[1] and k not in merged_pairs:
+                merged_pairs[k] = p
+        results = [[p] for p in merged_pairs.values()]
         # Enrich only a small profile batch in fast mode. Each lookup has its own timeout.
-        for profile in (profiles or [])[:12]:
+        for profile in (profiles or [])[:6]:
             chain=profile.get("chainId"); address=profile.get("tokenAddress")
             if not chain or not address:
                 stats["missing_data"] += 1; continue
-            pairs, err = await safe("pair", get_token_pairs(session,chain,address), 5, [])
+            pairs, err = await safe("pair", get_token_pairs(session,chain,address), 3, [])
             if err: stats["pair_errors"] += 1
             if pairs: results.append(pairs)
         stats["pair_responses"] = len(results)
