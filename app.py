@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.3.6-pro-onchain"
+APP_VERSION = "3.3.7-pro-direct-solana"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -95,6 +95,9 @@ MAX_PRICE_CHANGE_24H = 500
 EARLY_BUYER_WINDOW_HOURS = 24
 
 SOLANA_SIGNATURE_LIMIT = int(os.getenv("SOLANA_SIGNATURE_LIMIT", "80"))
+SOLANA_DIRECT_LIMIT = int(os.getenv("SOLANA_DIRECT_LIMIT", "25"))
+SOLANA_DIRECT_TTL_SECONDS = int(os.getenv("SOLANA_DIRECT_TTL_SECONDS", "900"))
+solana_direct_signatures = {}
 SOLANA_RPC_FALLBACKS = [x.strip() for x in os.getenv(
     "SOLANA_RPC_FALLBACKS", "https://solana-rpc.publicnode.com"
 ).split(",") if x.strip()]
@@ -546,6 +549,51 @@ def meme_signal(
 # DISCOVERY
 # ============================================================
 
+def _extract_mints_from_parsed_tx(tx):
+    """Return non-native SPL token mints touched by a parsed Solana transaction."""
+    if not isinstance(tx, dict): return []
+    meta = tx.get("meta") or {}
+    mints = []
+    for side in ("preTokenBalances", "postTokenBalances"):
+        for row in meta.get(side) or []:
+            mint = row.get("mint")
+            if mint and mint not in {"So11111111111111111111111111111111111111112"}:
+                mints.append(mint)
+    return list(dict.fromkeys(mints))
+
+async def get_direct_solana_pairs(session):
+    """Discover token mints from recent AMM/launch-program transactions via Solana RPC.
+    Market enrichment is best-effort; 429s never erase the on-chain discovery diagnostics.
+    """
+    now = time.time()
+    # Merge signatures captured by WS with recent signatures queried directly from each program.
+    sigs = [(sig, ts) for sig, ts in solana_direct_signatures.items() if now-ts <= SOLANA_DIRECT_TTL_SECONDS]
+    health=[]
+    for program in SOLANA_PROGRAM_IDS:
+        rows, source, errors = await solana_rpc_with_fallback(session, "getSignaturesForAddress", [program,{"limit":SOLANA_DIRECT_LIMIT}])
+        if isinstance(rows,list):
+            health.append(f"{program[:5]}:ok:{len(rows)}")
+            for r in rows:
+                sig=r.get("signature"); bt=r.get("blockTime") or int(now)
+                if sig and now-bt <= SOLANA_DIRECT_TTL_SECONDS: sigs.append((sig,bt))
+        else: health.append(f"{program[:5]}:rpc-error")
+    sigs=list(dict.fromkeys(sigs))[:SOLANA_DIRECT_LIMIT*len(SOLANA_PROGRAM_IDS)]
+    mints=[]
+    for sig,_ in sigs:
+        tx, source, errors = await solana_rpc_with_fallback(session,"getTransaction",[sig,{"encoding":"jsonParsed","maxSupportedTransactionVersion":0,"commitment":"confirmed"}])
+        for mint in _extract_mints_from_parsed_tx(tx):
+            if mint not in mints: mints.append(mint)
+        if len(mints)>=SOLANA_DIRECT_LIMIT: break
+    pairs=[]; enrich429=0
+    for mint in mints[:SOLANA_DIRECT_LIMIT]:
+        try:
+            got=await get_token_pairs(session,"solana",mint)
+            if got: pairs.extend(got)
+        except Exception as exc:
+            if "429" in str(exc): enrich429+=1
+        await asyncio.sleep(.25)
+    return pairs, {"signatures":len(sigs),"mints":len(mints),"pairs":len(pairs),"enrich429":enrich429,"rpc":";".join(health)}
+
 async def discover_candidates():
 
     candidates = []
@@ -560,10 +608,12 @@ async def discover_candidates():
     }
 
     async with aiohttp.ClientSession() as session:
-        # Independent primary fallback: GeckoTerminal new pools (no DexScreener dependency).
+        # Direct Solana on-chain discovery is independent of market-data indexers.
+        direct_sol, direct_health = await get_direct_solana_pairs(session)
         sol_gt, sol_health = await get_gecko_new_pools(session, "solana", "solana")
         eth_gt, eth_health = await get_gecko_new_pools(session, "eth", "ethereum")
         profiles, source_health = await get_discovery_profiles(session)
+        source_health["solana_direct"] = f"sigs:{direct_health['signatures']} mints:{direct_health['mints']} pairs:{direct_health['pairs']} enrich429:{direct_health['enrich429']}"
         source_health["gecko_solana"] = sol_health
         source_health["gecko_ethereum"] = eth_health
         stats["source_health"] = source_health
@@ -571,7 +621,7 @@ async def discover_candidates():
 
         # Gecko pairs can be filtered immediately. DexScreener profiles are enriched
         # conservatively and only when available, preventing 429 from zeroing scans.
-        results = [[p] for p in (sol_gt + eth_gt)]
+        results = [[p] for p in (direct_sol + sol_gt + eth_gt)]
         profiles = profiles[:30]
         for profile in profiles:
             chain = profile.get("chainId"); address = profile.get("tokenAddress")
@@ -2023,6 +2073,14 @@ async def solana_ws_watcher():
                 async for message in ws:
                     payload = json.loads(message)
                     if payload.get("method") == "logsNotification":
+                        value = ((payload.get("params") or {}).get("result") or {}).get("value") or {}
+                        sig = value.get("signature")
+                        if sig:
+                            solana_direct_signatures[sig] = time.time()
+                            # prune old entries
+                            cutoff=time.time()-SOLANA_DIRECT_TTL_SECONDS
+                            for k,v in list(solana_direct_signatures.items()):
+                                if v < cutoff: solana_direct_signatures.pop(k,None)
                         scan_trigger.set()
         except asyncio.CancelledError:
             raise

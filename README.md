@@ -10,3 +10,11 @@ Changes:
 - Market score can no longer by itself create a TOP-EARLY alert.
 
 No private key or real-money auto-trading is included.
+
+## v3.3.7 Pro Direct Solana
+- Solana discovery now queries configured launch/AMM program IDs directly via RPC (`getSignaturesForAddress`).
+- WebSocket program-log signatures are cached briefly and fed into discovery.
+- Parsed transactions are inspected for SPL token mints before optional market-data enrichment.
+- `/scan` source diagnostics include `solana_direct=sigs:... mints:... pairs:... enrich429:...`.
+- DexScreener/GeckoTerminal remain best-effort enrichers/fallbacks; their HTTP 429 responses no longer prevent direct on-chain discovery from running.
+- New optional env vars: `SOLANA_DIRECT_LIMIT` (default 25), `SOLANA_DIRECT_TTL_SECONDS` (default 900).
