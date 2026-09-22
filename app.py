@@ -4,14 +4,20 @@ import asyncio
 from datetime import datetime, timezone
 
 import aiohttp
+import json
+import time
+import websockets
+from aiohttp import web
 from dotenv import load_dotenv
 
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
 )
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 load_dotenv()
 
@@ -20,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.3-real-early-buyers"
+APP_VERSION = "3.3.1-pro"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -51,10 +57,25 @@ ALERT_SCORE = int(
     os.getenv("ALERT_SCORE", "65")
 )
 
-DB_FILE = os.getenv(
-    "DB_FILE",
-    "scanner.db"
-)
+DB_FILE = os.getenv("DB_FILE", "scanner.db")
+SOLANA_WS = os.getenv("SOLANA_WS", "wss://api.mainnet-beta.solana.com")
+PORT = int(os.getenv("PORT", "10000"))
+AUTO_ALERT = os.getenv("AUTO_ALERT", "true").lower() in {"1", "true", "yes", "on"}
+PAPER_AMOUNT_USD = float(os.getenv("PAPER_AMOUNT_USD", "25"))
+ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "120"))
+
+# Verified/default Solana launch/AMM programs. Extra IDs can be added via SOLANA_PROGRAM_IDS.
+DEFAULT_SOLANA_PROGRAM_IDS = [
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  # pump.fun
+    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",  # PumpSwap
+    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",  # Raydium CPMM
+]
+SOLANA_PROGRAM_IDS = [x.strip() for x in os.getenv(
+    "SOLANA_PROGRAM_IDS", ",".join(DEFAULT_SOLANA_PROGRAM_IDS)
+).split(",") if x.strip()]
+
+scan_trigger = asyncio.Event()
+last_scan_cache = []
 
 
 # ============================================================
@@ -127,18 +148,7 @@ BLOCKED_NAME_TERMS = {
 # ERC20 TRANSFER EVENT
 # ============================================================
 
-ERC20_TRANSFER_TOPIC = (
-    "0xddf252ad1be2c89b69c2b068fc378daa"
-    "952ba7f163c4a11628f55aeb"
-    "4d523b3ef"
-)
-
-# Normalized full topic.
-ERC20_TRANSFER_TOPIC = (
-    "0xddf252ad1be2c89b69c2b068fc378daa"
-    "952ba7f163c4a11628f55aeb"
-    "4d523b3ef"
-).replace(" ", "")
+ERC20_TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 
 
 # ============================================================
@@ -174,6 +184,14 @@ def init_db():
             price REAL,
             amount_usd REAL,
             status TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS alerts (
+            pair_address TEXT PRIMARY KEY,
+            alerted_at REAL NOT NULL,
+            score INTEGER NOT NULL
         )
     """)
 
@@ -1680,6 +1698,7 @@ async def analyze_candidate(
 
 async def perform_scan():
 
+    global last_scan_cache
     raw = await discover_candidates()
 
     if not raw:
@@ -1728,11 +1747,10 @@ async def perform_scan():
         reverse=True
     )
 
+    last_scan_cache = analyzed[:10]
     return {
-        "checked":
-            len(raw),
-        "candidates":
-            analyzed[:5]
+        "checked": len(raw),
+        "candidates": analyzed[:5]
     }
 
 
@@ -1807,6 +1825,37 @@ def format_early_buyers(
             )
 
     return text.rstrip()
+
+
+# ============================================================
+# ALERT / PAPER HELPERS
+# ============================================================
+
+def alert_is_due(candidate):
+    conn = sqlite3.connect(DB_FILE)
+    row = conn.execute("SELECT alerted_at, score FROM alerts WHERE pair_address=?", (candidate["pair_address"],)).fetchone()
+    conn.close()
+    if not row:
+        return True
+    age_minutes = (time.time() - row[0]) / 60
+    return age_minutes >= ALERT_COOLDOWN_MINUTES and candidate["score"] > row[1]
+
+
+def mark_alerted(candidate):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("INSERT OR REPLACE INTO alerts(pair_address, alerted_at, score) VALUES(?,?,?)", (candidate["pair_address"], time.time(), candidate["score"]))
+    conn.commit(); conn.close()
+
+
+def save_paper_trade(candidate, amount_usd=PAPER_AMOUNT_USD):
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""INSERT INTO paper_trades(created_at, token, symbol, chain, address, price, amount_usd, status)
+                    VALUES(?,?,?,?,?,?,?,?)""", (now().isoformat(), candidate["name"], candidate["symbol"], candidate["chain"], candidate["address"], candidate["price_usd"], amount_usd, "OPEN"))
+    conn.commit(); conn.close()
+
+
+def candidate_keyboard(candidate):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"🧪 Paper Buy ${PAPER_AMOUNT_USD:.0f}", callback_data=f"paper:{candidate['pair_address']}")]])
 
 
 # ============================================================
@@ -1913,7 +1962,10 @@ async def status(
         "Ethereum Analyse: aktiv\n"
         "Risikoanalyse: aktiv\n"
         "Early-Token-Filter: aktiv\n"
-        "Real Early-Buyer Detection: aktiv\n\n"
+        "Real Early-Buyer Detection: aktiv\n"
+        f"Solana WebSocket: {len(SOLANA_PROGRAM_IDS)} Programme\n"
+        f"Auto-Alerts: {'aktiv' if AUTO_ALERT else 'aus'}\n"
+        f"Health-Port: {PORT}\n\n"
         f"Version: {APP_VERSION}\n"
         f"Scan-Intervall: "
         f"{SCAN_INTERVAL}s\n"
@@ -2075,6 +2127,65 @@ async def buy(
     )
 
 
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if not data.startswith("paper:"):
+        return
+    pair_address = data.split(":", 1)[1]
+    candidate = next((c for c in last_scan_cache if c.get("pair_address") == pair_address), None)
+    if not candidate:
+        await query.message.reply_text("⚠️ Kandidat ist nicht mehr im aktuellen Scan-Cache. Bitte /scan erneut ausführen.")
+        return
+    save_paper_trade(candidate)
+    await query.message.reply_text(
+        f"🧪 Paper-Trade gespeichert\n{candidate['name']} ({candidate['symbol']})\n"
+        f"Entry: ${candidate['price_usd']:.10f}\nBetrag: ${PAPER_AMOUNT_USD:.2f}\nKein echtes Geld wurde verwendet."
+    )
+
+
+async def health_handler(request):
+    return web.json_response({"ok": True, "version": APP_VERSION, "scanner": "running"})
+
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"[HEALTH] listening on 0.0.0.0:{PORT}")
+    return runner
+
+
+async def solana_ws_watcher():
+    """Low-latency trigger. It does not trust logs as analysis; it wakes the verified Dex/RPC scan."""
+    while True:
+        try:
+            async with websockets.connect(SOLANA_WS, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
+                for idx, program_id in enumerate(SOLANA_PROGRAM_IDS, 1):
+                    await ws.send(json.dumps({
+                        "jsonrpc": "2.0", "id": idx, "method": "logsSubscribe",
+                        "params": [{"mentions": [program_id]}, {"commitment": "processed"}]
+                    }))
+                    await ws.recv()
+                print(f"[WS] watching {len(SOLANA_PROGRAM_IDS)} Solana programs")
+                async for message in ws:
+                    payload = json.loads(message)
+                    if payload.get("method") == "logsNotification":
+                        scan_trigger.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print("[WS ERROR]", type(exc).__name__, str(exc))
+            await asyncio.sleep(5)
+
+
 # ============================================================
 # BACKGROUND SCANNER
 # ============================================================
@@ -2096,31 +2207,21 @@ async def scanner_loop(
             ]
 
             if candidates:
-
-                print(
-                    "[SCAN]",
-                    len(candidates),
-                    "Kandidaten gefunden."
-                )
-
+                print("[SCAN]", len(candidates), "Kandidaten gefunden.")
                 for candidate in candidates:
-
-                    buyers = candidate[
-                        "early_buyers"
-                    ][
-                        "buyer_count"
-                    ]
-
-                    print(
-                        "[CANDIDATE]",
-                        candidate["name"],
-                        candidate["symbol"],
-                        candidate["chain"],
-                        "Score=",
-                        candidate["score"],
-                        "EarlyBuyers=",
-                        buyers
-                    )
+                    buyers = candidate["early_buyers"]["buyer_count"]
+                    print("[CANDIDATE]", candidate["name"], candidate["symbol"], candidate["chain"], "Score=", candidate["score"], "EarlyBuyers=", buyers)
+                    if AUTO_ALERT and ALLOWED_CHAT_ID and alert_is_due(candidate):
+                        try:
+                            await application.bot.send_message(
+                                chat_id=ALLOWED_CHAT_ID,
+                                text="🚨 EARLY ALERT\n\n" + format_candidate(1, candidate),
+                                disable_web_page_preview=True,
+                                reply_markup=candidate_keyboard(candidate),
+                            )
+                            mark_alerted(candidate)
+                        except Exception as exc:
+                            print("[ALERT ERROR]", type(exc).__name__, str(exc))
 
         except Exception as e:
 
@@ -2130,9 +2231,12 @@ async def scanner_loop(
                 str(e)
             )
 
-        await asyncio.sleep(
-            SCAN_INTERVAL
-        )
+        try:
+            await asyncio.wait_for(scan_trigger.wait(), timeout=SCAN_INTERVAL)
+            scan_trigger.clear()
+            await asyncio.sleep(2)  # give indexers a moment to expose the new pair
+        except asyncio.TimeoutError:
+            pass
 
 
 async def post_init(
@@ -2141,11 +2245,9 @@ async def post_init(
 
     init_db()
 
-    application.create_task(
-        scanner_loop(
-            application
-        )
-    )
+    application.create_task(scanner_loop(application))
+    application.create_task(solana_ws_watcher())
+    application.create_task(start_health_server())
 
 
 # ============================================================
@@ -2205,6 +2307,8 @@ def main():
             buy
         )
     )
+
+    application.add_handler(CallbackQueryHandler(button_callback))
 
     print(
         f"🚀 Memecoin Scanner "
