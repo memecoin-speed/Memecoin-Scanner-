@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.3.1-pro"
+APP_VERSION = "3.3.2-pro"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -831,8 +831,14 @@ def calculate_score(c):
     elif 50 < change <= 150:
         score += 8
 
-    elif change < 0:
-        score += 4
+    elif -20 <= change < 0:
+        score += 2
+
+    elif -40 <= change < -20:
+        score -= 8
+
+    elif change < -40:
+        score -= 25
 
     elif change > 300:
         score -= 15
@@ -870,6 +876,15 @@ def analyze_market_risk(c):
     if change > 150:
         risks.append(
             "Starker Preisanstieg"
+        )
+
+    if change <= -60:
+        risks.append(
+            "Extremer Preisabsturz"
+        )
+    elif change <= -35:
+        risks.append(
+            "Starker Preisrückgang"
         )
 
     if c["volume"] > (
@@ -1294,205 +1309,104 @@ def token_balance_map(
     return result
 
 
-async def solana_early_buyers(
-    session,
-    candidate
-):
-
+async def solana_early_buyers(session, candidate):
     result = {
         "buyers": [],
         "buyer_count": 0,
         "earliest_minutes": None,
-        "status":
-            "⚪ Keine Daten"
+        "status": "⚪ Keine Daten",
     }
 
-    pair = candidate[
-        "pair_address"
-    ]
+    pair = candidate["pair_address"]
+    mint = candidate["address"]
 
-    mint = candidate[
-        "address"
-    ]
-
-    signatures = (
-        await solana_rpc_call(
+    # A Solana DEX swap is not guaranteed to be indexed under the pool/pair
+    # address returned by Dexscreener. Query both pool and token mint, then
+    # de-duplicate signatures before parsing token balance deltas.
+    signature_infos = []
+    seen_signatures = set()
+    for address in (pair, mint):
+        if not address:
+            continue
+        rows = await solana_rpc_call(
             session,
             "getSignaturesForAddress",
-            [
-                pair,
-                {
-                    "limit":
-                        SOLANA_SIGNATURE_LIMIT,
-                    "commitment":
-                        "confirmed"
-                }
-            ]
+            [address, {"limit": SOLANA_SIGNATURE_LIMIT, "commitment": "confirmed"}],
         )
-    )
+        for row in rows or []:
+            sig = row.get("signature")
+            if sig and sig not in seen_signatures:
+                seen_signatures.add(sig)
+                signature_infos.append(row)
 
-    if not signatures:
-        result["status"] = (
-            "⚪ Keine Pool-Transaktionen"
-        )
+    if not signature_infos:
+        result["status"] = "⚪ Keine Token-/Pool-Transaktionen"
         return result
 
+    # Process oldest first so the result represents the earliest buyers in
+    # the sampled transaction window rather than whichever RPC row came first.
+    signature_infos.sort(key=lambda x: x.get("blockTime") or 0)
     found = {}
 
-    for signature_info in signatures:
-
-        signature = (
-            signature_info.get(
-                "signature"
-            )
-        )
-
+    for signature_info in signature_infos:
+        signature = signature_info.get("signature")
         if not signature:
             continue
-
         tx = await solana_rpc_call(
             session,
             "getTransaction",
-            [
-                signature,
-                {
-                    "encoding":
-                        "jsonParsed",
-                    "commitment":
-                        "confirmed",
-                    "maxSupportedTransactionVersion":
-                        0
-                }
-            ]
+            [signature, {
+                "encoding": "jsonParsed",
+                "commitment": "confirmed",
+                "maxSupportedTransactionVersion": 0,
+            }],
         )
-
         if not tx:
             continue
-
-        meta = tx.get(
-            "meta"
-        ) or {}
-
-        if meta.get(
-            "err"
-        ):
+        meta = tx.get("meta") or {}
+        if meta.get("err"):
             continue
 
-        pre = token_balance_map(
-            meta.get(
-                "preTokenBalances"
-            ),
-            mint
-        )
+        pre = token_balance_map(meta.get("preTokenBalances"), mint)
+        post = token_balance_map(meta.get("postTokenBalances"), mint)
+        block_time = tx.get("blockTime") or signature_info.get("blockTime")
 
-        post = token_balance_map(
-            meta.get(
-                "postTokenBalances"
-            ),
-            mint
-        )
-
-        owners = set(
-            pre.keys()
-        ) | set(
-            post.keys()
-        )
-
-        block_time = tx.get(
-            "blockTime"
-        )
-
-        for owner in owners:
-
-            before = pre.get(
-                owner,
-                0
-            )
-
-            after = post.get(
-                owner,
-                0
-            )
-
-            delta = (
-                after - before
-            )
-
-            if delta <= 0:
+        for owner in set(pre) | set(post):
+            delta = post.get(owner, 0) - pre.get(owner, 0)
+            if delta <= 0 or not owner:
                 continue
-
-            if owner.lower() == (
-                pair.lower()
-            ):
+            # Pool/program-owned balances normally have no useful wallet owner;
+            # this also avoids the obvious pair address when it appears as owner.
+            if owner.lower() == pair.lower():
                 continue
-
-            if owner not in found:
-
+            current = found.get(owner)
+            if current is None:
                 found[owner] = {
-                    "wallet":
-                        owner,
-                    "amount":
-                        delta,
-                    "block_time":
-                        block_time,
-                    "signature":
-                        signature
+                    "wallet": owner,
+                    "amount": delta,
+                    "block_time": block_time,
+                    "signature": signature,
                 }
-
             else:
-
-                found[
-                    owner
-                ]["amount"] += delta
-
-                old_time = found[
-                    owner
-                ].get(
-                    "block_time"
-                )
-
-                if (
-                    block_time
-                    and (
-                        not old_time
-                        or block_time
-                        < old_time
-                    )
-                ):
-                    found[
-                        owner
-                    ]["block_time"
-                    ] = block_time
-
-        await asyncio.sleep(
-            0.03
-        )
+                current["amount"] += delta
+                if block_time and (not current.get("block_time") or block_time < current["block_time"]):
+                    current["block_time"] = block_time
+                    current["signature"] = signature
+        await asyncio.sleep(0.04)
 
     if not found:
-
-        result["status"] = (
-            "⚪ Keine frühen Wallet-Käufer"
-        )
+        result["status"] = "⚪ Keine Käufer-Wallets im RPC-Fenster"
         return result
 
-    ordered = sorted(
-        found.values(),
-        key=lambda x: (
-            x["block_time"]
-            or 0
-        )
-    )
-
+    ordered = sorted(found.values(), key=lambda x: x.get("block_time") or 0)
     result["buyers"] = ordered[:10]
+    result["buyer_count"] = len(ordered)
 
-    result["buyer_count"] = len(
-        ordered
-    )
+    earliest = next((x.get("block_time") for x in ordered if x.get("block_time")), None)
+    if earliest:
+        result["earliest_minutes"] = max(0, int((time.time() - earliest) / 60))
 
-    result["status"] = (
-        "🟢 Frühe Wallet-Käufer erkannt"
-    )
-
+    result["status"] = "🟢 Frühe Wallet-Käufer erkannt"
     return result
 
 
