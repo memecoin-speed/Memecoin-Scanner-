@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.3.7-pro-direct-solana"
+APP_VERSION = "3.3.8-pro-buyer-debug"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -1574,6 +1574,7 @@ async def perform_scan():
         }
 
     analyzed = []
+    buyer_diag = {"rejected_no_buyers": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0}
 
     for candidate in raw:
 
@@ -1585,10 +1586,16 @@ async def perform_scan():
                 )
             )
 
-            # A TOP-EARLY candidate must have actual on-chain buyer evidence.
-            # Market score alone is not enough.
-            if (result["score"] >= ALERT_SCORE and
-                    result.get("early_buyers", {}).get("buyer_count", 0) >= 2):
+            # Hard gate: never label a token TOP-EARLY without buyer evidence.
+            eb = result.get("early_buyers", {}) or {}
+            bc = int(eb.get("buyer_count", 0) or 0)
+            buyer_diag["signatures"] += int(eb.get("signatures_found", 0) or 0)
+            buyer_diag["transactions"] += int(eb.get("transactions_parsed", 0) or 0)
+            buyer_diag["rpc_errors"] += len(eb.get("rpc_errors", []) or [])
+            if bc < 2:
+                buyer_diag["rejected_no_buyers"] += 1
+                continue
+            if result["score"] >= ALERT_SCORE:
                 analyzed.append(result)
 
         except Exception as e:
@@ -1615,7 +1622,7 @@ async def perform_scan():
         "checked": len(raw),
         "analyzed": len(raw),
         "candidates": analyzed[:5],
-        "diagnostics": diagnostics,
+        "diagnostics": {**diagnostics, "buyer_diag": buyer_diag},
     }
 
 
