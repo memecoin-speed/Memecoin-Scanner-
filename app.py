@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.4.5-pro-persistent-cache"
+APP_VERSION = "3.4.6-pro-discovery-pipeline-fix"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -107,7 +107,7 @@ EARLY_BUYER_WINDOW_HOURS = 24
 SOLANA_SIGNATURE_LIMIT = int(os.getenv("SOLANA_SIGNATURE_LIMIT", "20"))
 RPC_CALL_TIMEOUT = int(os.getenv("RPC_CALL_TIMEOUT", "6"))
 CANDIDATE_ANALYSIS_TIMEOUT = int(os.getenv("CANDIDATE_ANALYSIS_TIMEOUT", "28"))
-DISCOVERY_STAGE_TIMEOUT = int(os.getenv("DISCOVERY_STAGE_TIMEOUT", "24"))
+DISCOVERY_STAGE_TIMEOUT = int(os.getenv("DISCOVERY_STAGE_TIMEOUT", "40"))
 SOLANA_DIRECT_LIMIT = int(os.getenv("SOLANA_DIRECT_LIMIT", "25"))
 SOLANA_DIRECT_TTL_SECONDS = int(os.getenv("SOLANA_DIRECT_TTL_SECONDS", "900"))
 solana_direct_signatures = {}
@@ -660,7 +660,7 @@ async def get_direct_solana_pairs(session):
     return pairs, {"signatures":len(sigs),"mints":len(mints),"pairs":len(pairs),"enrich429":enrich429,"rpc":";".join(health)}
 
 async def discover_candidates():
-    """Fast, fault-isolated discovery. No single provider may zero the whole scan."""
+    """Fault-isolated discovery pipeline. Diagnostics and cache are always populated."""
     candidates = []
     stats = {
         "profiles": 0, "pair_responses": 0, "pairs": 0,
@@ -670,62 +670,77 @@ async def discover_candidates():
         "vol_low": 0, "vol_high": 0, "txns_low": 0,
         "price_change_high": 0, "meme_filter": 0, "passed": 0,
         "pair_errors": 0,
+        "source_health": {"pipeline": "started"},
     }
+    source_health = stats["source_health"]
+
+    # Load cache before touching the network, so provider failure can never erase fallback data.
+    try:
+        cached_pairs = load_persistent_pairs()
+        source_health["persistent_cache"] = f"loaded:{len(cached_pairs)}"
+    except Exception as exc:
+        cached_pairs = []
+        source_health["persistent_cache"] = f"error:{type(exc).__name__}"
 
     async def safe(label, coro, timeout, fallback):
         try:
             value = await asyncio.wait_for(coro, timeout=timeout)
             return value, None
         except asyncio.TimeoutError:
-            return fallback, f"{label}=timeout:{timeout}s"
+            return fallback, f"timeout:{timeout}s"
         except Exception as exc:
-            return fallback, f"{label}={type(exc).__name__}"
+            return fallback, f"error:{type(exc).__name__}"
 
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
-        # Run independent sources concurrently. Direct Solana gets a tighter budget because
-        # market feeds should still return quickly when a public RPC is slow.
-        gt_sol_t = asyncio.create_task(safe("gecko_solana", get_gecko_new_pools(session,"solana","solana"), 7, ([],"timeout")))
-        gt_eth_t = asyncio.create_task(safe("gecko_ethereum", get_gecko_new_pools(session,"eth","ethereum"), 7, ([],"timeout")))
-        dex_t = asyncio.create_task(safe("dex", get_discovery_profiles(session), 10, ([],{})))
-        direct_t = asyncio.create_task(safe("solana_direct", get_direct_solana_pairs(session), 10, ([],{"signatures":0,"mints":0,"pairs":0,"enrich429":0,"rpc":"timeout"})))
-
-        (sol_pack, sol_err), (eth_pack, eth_err), (dex_pack, dex_err), (direct_pack, direct_err) = await asyncio.gather(gt_sol_t, gt_eth_t, dex_t, direct_t)
+    live_pairs = []
+    profiles = []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+        tasks = [
+            asyncio.create_task(safe("gecko_solana", get_gecko_new_pools(session,"solana","solana"), 6, ([],"timeout"))),
+            asyncio.create_task(safe("gecko_ethereum", get_gecko_new_pools(session,"eth","ethereum"), 6, ([],"timeout"))),
+            asyncio.create_task(safe("dex", get_discovery_profiles(session), 8, ([],{}))),
+            asyncio.create_task(safe("solana_direct", get_direct_solana_pairs(session), 8, ([],{"signatures":0,"mints":0,"pairs":0,"enrich429":0,"rpc":"timeout"}))),
+        ]
+        sol_res, eth_res, dex_res, direct_res = await asyncio.gather(*tasks)
+        (sol_pack, sol_err), (eth_pack, eth_err), (dex_pack, dex_err), (direct_pack, direct_err) = sol_res, eth_res, dex_res, direct_res
         sol_gt, sol_health = sol_pack
         eth_gt, eth_health = eth_pack
-        profiles, source_health = dex_pack
+        profiles, dex_health = dex_pack
         direct_sol, direct_health = direct_pack
-        source_health = dict(source_health or {})
-        if dex_err: source_health["dex_watchdog"] = dex_err
+        source_health.update(dict(dex_health or {}))
         source_health["gecko_solana"] = sol_err or sol_health
         source_health["gecko_ethereum"] = eth_err or eth_health
+        source_health["dex_watchdog"] = dex_err or "ok"
         source_health["solana_direct"] = direct_err or f"sigs:{direct_health.get('signatures',0)} mints:{direct_health.get('mints',0)} pairs:{direct_health.get('pairs',0)} enrich429:{direct_health.get('enrich429',0)}"
-        stats["source_health"] = source_health
         stats["profiles"] = len(profiles or [])
-
         live_pairs = (direct_sol or []) + (sol_gt or []) + (eth_gt or [])
+
         if live_pairs:
-            save_persistent_pairs(live_pairs)
-        cached_pairs = load_persistent_pairs()
-        source_health["persistent_cache"] = f"loaded:{len(cached_pairs)}"
-        # Cache supplements live feeds and becomes the fallback when every public source is throttled.
+            try:
+                save_persistent_pairs(live_pairs)
+                source_health["cache_write"] = f"saved:{len(live_pairs)}"
+            except Exception as exc:
+                source_health["cache_write"] = f"error:{type(exc).__name__}"
+
         merged_pairs = {}
-        for p in live_pairs + cached_pairs:
-            if not isinstance(p, dict):
-                continue
-            k = ((p.get("chainId") or "").lower(), p.get("pairAddress") or "")
-            if k[1] and k not in merged_pairs:
-                merged_pairs[k] = p
+        for pair in live_pairs + cached_pairs:
+            if isinstance(pair, dict):
+                key = ((pair.get("chainId") or "").lower(), pair.get("pairAddress") or "")
+                if key[1]: merged_pairs.setdefault(key, pair)
         results = [[p] for p in merged_pairs.values()]
-        # Enrich only a small profile batch in fast mode. Each lookup has its own timeout.
-        for profile in (profiles or [])[:6]:
+
+        # Enrich profiles concurrently; sequential 3s waits previously exceeded the outer watchdog.
+        async def enrich(profile):
             chain=profile.get("chainId"); address=profile.get("tokenAddress")
-            if not chain or not address:
-                stats["missing_data"] += 1; continue
-            pairs, err = await safe("pair", get_token_pairs(session,chain,address), 3, [])
-            if err: stats["pair_errors"] += 1
+            if not chain or not address: return [], "missing"
+            return await safe("pair", get_token_pairs(session,chain,address), 2.5, [])
+        enrich_results = await asyncio.gather(*(enrich(p) for p in (profiles or [])[:6])) if profiles else []
+        for pairs, err in enrich_results:
+            if err:
+                if err == "missing": stats["missing_data"] += 1
+                else: stats["pair_errors"] += 1
             if pairs: results.append(pairs)
         stats["pair_responses"] = len(results)
-
+        source_health["pipeline"] = "providers_done"
         for pairs in results:
             for pair in pairs or []:
                 stats["pairs"] += 1
@@ -761,6 +776,7 @@ async def discover_candidates():
         unique.setdefault((c["chain"],c["pair_address"]),c)
     stats["passed_unique"]=len(unique)
     return list(unique.values()), stats
+
 
 
 # ============================================================
@@ -1650,7 +1666,7 @@ async def perform_scan(progress=None):
     try:
         raw, diagnostics = await asyncio.wait_for(discover_candidates(), timeout=DISCOVERY_STAGE_TIMEOUT)
     except asyncio.TimeoutError:
-        raw, diagnostics = [], {"discovery_sources": [f"watchdog=timeout:{DISCOVERY_STAGE_TIMEOUT}s"]}
+        raw, diagnostics = [], {"source_health": {"pipeline": f"outer_timeout:{DISCOVERY_STAGE_TIMEOUT}s"}}
         stage_diag["stage"] = "discovery_timeout"
 
     diagnostics = diagnostics or {}

@@ -7,3 +7,7 @@
 - Paper trading only; no private keys or automatic real-money execution.
 
 Version: `3.4.4-pro-fast-discovery`
+
+
+## v3.4.6
+Discovery pipeline fix: cache is loaded before network calls, providers are isolated, profile enrichment runs concurrently, and diagnostics always show pipeline/provider state.
