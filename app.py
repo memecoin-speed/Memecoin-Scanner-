@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.5.5-pro-ultra-early-selection-fix"
+APP_VERSION = "3.5.6-pro-rpc-optimizer"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -85,7 +85,14 @@ PERSISTENT_PAIR_CACHE_TTL = int(os.getenv("PERSISTENT_PAIR_CACHE_TTL", "21600"))
 PAIR_CACHE_TTL = int(os.getenv("PAIR_CACHE_TTL", "900"))
 discovery_feed_cache = {}
 token_pair_cache = {}
-solana_rpc_semaphore = asyncio.Semaphore(int(os.getenv("SOLANA_RPC_CONCURRENCY", "3")))
+# Keep public RPC pressure deliberately low. Buyer analyses can run concurrently,
+# but the RPC transport itself is throttled to avoid burst 429s.
+solana_rpc_semaphore = asyncio.Semaphore(int(os.getenv("SOLANA_RPC_CONCURRENCY", "2")))
+SOLANA_TX_CACHE_TTL = int(os.getenv("SOLANA_TX_CACHE_TTL", "900"))
+SOLANA_RPC_429_COOLDOWN = float(os.getenv("SOLANA_RPC_429_COOLDOWN", "1.5"))
+solana_tx_cache = {}          # signature -> (timestamp, tx, source)
+solana_tx_inflight = {}       # signature -> Future/Task, coalesces duplicate reads
+solana_rpc_cooldown_until = {}
 
 
 # ============================================================
@@ -1466,34 +1473,80 @@ def token_balance_map(
 
 
 async def solana_rpc_with_fallback(session, method, params):
-    """Bounded Solana RPC with one retry per endpoint and explicit diagnostics."""
+    """Rate-aware Solana RPC transport.
+
+    Uses low concurrency, skips endpoints during a short 429 cooldown and moves
+    to the fallback instead of immediately hammering the same public endpoint.
+    One retry is retained for non-429 transient failures.
+    """
     urls = []
     for url in [SOLANA_RPC] + SOLANA_RPC_FALLBACKS:
-        if url and url not in urls: urls.append(url)
+        if url and url not in urls:
+            urls.append(url)
     errors = []
     async with solana_rpc_semaphore:
         for url in urls:
+            wait = solana_rpc_cooldown_until.get(url, 0) - time.monotonic()
+            if wait > 0:
+                # Do not stall a buyer scan behind a rate-limited endpoint; try fallback.
+                continue
             for attempt in range(2):
                 payload = {"jsonrpc":"2.0","id":1,"method":method,"params":params}
                 try:
                     async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=RPC_CALL_TIMEOUT)) as response:
+                        if response.status == 429:
+                            errors.append(f"{method}:HTTP 429")
+                            solana_rpc_cooldown_until[url] = time.monotonic() + SOLANA_RPC_429_COOLDOWN
+                            break
                         if response.status != 200:
                             errors.append(f"{method}:HTTP {response.status}")
-                            if response.status == 429 and attempt == 0:
-                                await asyncio.sleep(0.8)
-                                continue
                             break
                         data = await response.json(content_type=None)
                         if data.get("error"):
-                            err=data["error"]; errors.append(f"{method}:RPC {err.get('code')}")
+                            err = data["error"]
+                            errors.append(f"{method}:RPC {err.get('code')}")
                             break
                         return data.get("result"), url, errors
                 except asyncio.TimeoutError:
                     errors.append(f"{method}:timeout")
                 except Exception as exc:
                     errors.append(f"{method}:{type(exc).__name__}")
-                if attempt == 0: await asyncio.sleep(0.5)
+                if attempt == 0:
+                    await asyncio.sleep(0.35)
     return None, None, errors
+
+
+async def solana_get_transaction_cached(session, signature):
+    """Fetch an immutable confirmed transaction once and reuse it across candidates/scans."""
+    now = time.monotonic()
+    cached = solana_tx_cache.get(signature)
+    if cached and now - cached[0] <= SOLANA_TX_CACHE_TTL:
+        return cached[1], cached[2], [], True
+
+    task = solana_tx_inflight.get(signature)
+    owner = task is None
+    if owner:
+        task = asyncio.create_task(solana_rpc_with_fallback(
+            session, "getTransaction",
+            [signature, {"encoding":"jsonParsed", "commitment":"confirmed", "maxSupportedTransactionVersion":0}],
+        ))
+        solana_tx_inflight[signature] = task
+    try:
+        tx, source, errors = await task
+        if tx is not None:
+            solana_tx_cache[signature] = (time.monotonic(), tx, source)
+        return tx, source, errors if owner else [], False
+    finally:
+        if owner:
+            solana_tx_inflight.pop(signature, None)
+        # Small bounded cache; confirmed transactions are immutable for our use.
+        if len(solana_tx_cache) > 512:
+            cutoff = time.monotonic() - SOLANA_TX_CACHE_TTL
+            stale = [k for k, v in solana_tx_cache.items() if v[0] < cutoff]
+            for k in stale:
+                solana_tx_cache.pop(k, None)
+            while len(solana_tx_cache) > 512:
+                solana_tx_cache.pop(next(iter(solana_tx_cache)), None)
 
 
 async def solana_early_buyers(session, candidate):
@@ -1555,11 +1608,9 @@ async def solana_early_buyers(session, candidate):
         sig = info.get("signature")
         if not sig: return info, None, None, []
         try:
-            tx, source, errors = await asyncio.wait_for(
-                solana_rpc_with_fallback(
-                    session, "getTransaction",
-                    [sig, {"encoding":"jsonParsed", "commitment":"confirmed", "maxSupportedTransactionVersion":0}],
-                ), timeout=max(5, RPC_CALL_TIMEOUT + 2)
+            tx, source, errors, _cached = await asyncio.wait_for(
+                solana_get_transaction_cached(session, sig),
+                timeout=max(5, RPC_CALL_TIMEOUT * 2 + 2)
             )
             return info, tx, source, errors
         except asyncio.TimeoutError:
