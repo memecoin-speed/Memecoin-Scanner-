@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.5.7-pro-buyer-intelligence"
+APP_VERSION = "3.5.8-pro-token-dedupe-precheck-selection"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -909,13 +909,41 @@ async def discover_candidates():
                 except Exception:
                     stats["pair_errors"] += 1
 
-    unique={}
+    # v3.5.8: dedupe by token mint, not only pair address. Multiple pools for the
+    # same token must not consume several of the three buyer-precheck slots.
+    def pair_quality(c):
+        # Prefer a strict-market pair first; otherwise prefer useful market data.
+        # Ultra-early status is handled separately when choosing prechecks.
+        return (
+            1 if c.get("strict_market_pass") else 0,
+            clean_number(c.get("liquidity")),
+            clean_number(c.get("volume")),
+            int(c.get("txns") or 0),
+            -clean_number(c.get("age_hours")),
+        )
+
+    by_token = {}
     for c in candidates:
-        unique.setdefault((c["chain"],c["pair_address"]),c)
-    strict = [c for c in unique.values() if c.get("strict_market_pass")]
-    precheck = sorted([c for c in unique.values() if c.get("buyer_precheck_only")], key=lambda c: (0 if c.get("ultra_early_precheck") else 1, c.get("age_hours", 999)))[:3]
+        token_key = (c.get("chain"), c.get("address"))
+        current = by_token.get(token_key)
+        if current is None or pair_quality(c) > pair_quality(current):
+            by_token[token_key] = c
+
+    strict = [c for c in by_token.values() if c.get("strict_market_pass")]
+    precheck_pool = [c for c in by_token.values() if c.get("buyer_precheck_only")]
+    precheck = sorted(
+        precheck_pool,
+        key=lambda c: (
+            0 if c.get("ultra_early_precheck") else 1,
+            c.get("age_hours", 999),
+            -clean_number(c.get("liquidity")),
+            -clean_number(c.get("volume")),
+            -int(c.get("txns") or 0),
+        ),
+    )[:3]
     stats["passed_unique"] = len(strict)
     stats["buyer_precheck_selected"] = len(precheck)
+    stats["token_dedupe_removed"] = max(0, len(candidates) - len(by_token))
     return strict + precheck, stats
 
 
@@ -2309,7 +2337,7 @@ def format_diagnostics(stats):
         f"Fehlende Daten/Alter: {stats.get('missing_data', 0) + stats.get('age_missing', 0)}\n"
         f"Blockiert: {stats.get('blocked', 0)}\n"
         f"Zu neu: {stats.get('too_new', 0)} | Zu alt: {stats.get('too_old', 0)}\n"
-        f"Ultra-Early Precheck: {stats.get('ultra_early_precheck', 0)} | Precheck ausgewählt: {stats.get('buyer_precheck_selected', 0)}\n"
+        f"Ultra-Early Precheck: {stats.get('ultra_early_precheck', 0)} | Precheck ausgewählt: {stats.get('buyer_precheck_selected', 0)} | Token-Duplikate entfernt: {stats.get('token_dedupe_removed', 0)}\n"
         f"Liquidität zu niedrig/hoch: {stats.get('liq_low', 0)}/{stats.get('liq_high', 0)}\n"
         f"Volumen zu niedrig/hoch: {stats.get('vol_low', 0)}/{stats.get('vol_high', 0)}\n"
         f"Zu wenig Txns: {stats.get('txns_low', 0)}\n"
