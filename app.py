@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.5.6-pro-rpc-optimizer"
+APP_VERSION = "3.5.7-pro-buyer-intelligence"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -1564,6 +1564,7 @@ async def solana_early_buyers(session, candidate):
         "tx_attempted": 0, "tx_skipped": 0,
         "wallet_candidates": 0, "token_inflows": 0,
         "swap_verified": 0, "rejected_no_payment": 0,
+        "strong_buyers": 0, "dust_buyers": 0, "meaningful_buyers": 0,
     }
     pair = candidate.get("pair_address") or ""
     mint = candidate.get("address") or ""
@@ -1702,6 +1703,22 @@ async def solana_early_buyers(session, candidate):
         return result
 
     ordered = sorted(found.values(), key=lambda x: x.get("block_time") or 0)
+    # Buyer intelligence is diagnostic only: the existing >=2 verified-buyer gate stays unchanged.
+    # Thresholds are deliberately simple and transparent; they do not imply profitability.
+    for rank, row in enumerate(ordered, 1):
+        sol = float(row.get("sol_spent", 0) or 0)
+        stable = float(row.get("stable_spent", 0) or 0)
+        row["early_rank"] = rank
+        if (0 < sol < 0.01) or (sol <= 0 and 0 < stable < 2):
+            row["buyer_strength"] = "dust"
+            result["dust_buyers"] += 1
+        elif sol >= 0.10 or stable >= 20:
+            row["buyer_strength"] = "strong"
+            result["strong_buyers"] += 1
+            result["meaningful_buyers"] += 1
+        else:
+            row["buyer_strength"] = "normal"
+            result["meaningful_buyers"] += 1
     result["buyers"] = ordered[:10]
     result["buyer_count"] = len(ordered)
     earliest = next((x.get("block_time") for x in ordered if x.get("block_time")), None)
@@ -1923,7 +1940,7 @@ async def perform_scan(progress=None):
         return {"checked": 0, "analyzed": 0, "candidates": [], "diagnostics": diagnostics}
 
     analyzed = []
-    buyer_diag = {"rejected_no_buyers": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0, "tx_attempted": 0, "tx_skipped": 0, "wallet_candidates": 0, "token_inflows": 0, "swap_verified": 0, "rejected_no_payment": 0, "per_coin": []}
+    buyer_diag = {"rejected_no_buyers": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0, "tx_attempted": 0, "tx_skipped": 0, "wallet_candidates": 0, "token_inflows": 0, "swap_verified": 0, "rejected_no_payment": 0, "strong_buyers": 0, "dust_buyers": 0, "meaningful_buyers": 0, "per_coin": []}
 
     for idx, candidate in enumerate(raw, 1):
         await report(f"Buyer-Analyse {idx}/{len(raw)}")
@@ -1948,6 +1965,9 @@ async def perform_scan(progress=None):
         buyer_diag["token_inflows"] += int(eb.get("token_inflows", 0) or 0)
         buyer_diag["swap_verified"] += int(eb.get("swap_verified", 0) or 0)
         buyer_diag["rejected_no_payment"] += int(eb.get("rejected_no_payment", 0) or 0)
+        buyer_diag["strong_buyers"] += int(eb.get("strong_buyers", 0) or 0)
+        buyer_diag["dust_buyers"] += int(eb.get("dust_buyers", 0) or 0)
+        buyer_diag["meaningful_buyers"] += int(eb.get("meaningful_buyers", 0) or 0)
         errs = eb.get("rpc_errors", []) or []
         buyer_diag["per_coin"].append({
             "name": result.get("name") or result.get("symbol") or "?",
@@ -1959,6 +1979,9 @@ async def perform_scan(progress=None):
             "wallet_candidates": int(eb.get("wallet_candidates", 0) or 0),
             "token_inflows": int(eb.get("token_inflows", 0) or 0),
             "swap_verified": int(eb.get("swap_verified", 0) or 0),
+            "strong_buyers": int(eb.get("strong_buyers", 0) or 0),
+            "dust_buyers": int(eb.get("dust_buyers", 0) or 0),
+            "meaningful_buyers": int(eb.get("meaningful_buyers", 0) or 0),
             "buyer_count": bc,
             "gate": "PASS" if bc >= 2 else "REJECT",
         })
@@ -2054,11 +2077,15 @@ def format_early_buyers(
                 payment = f" | -{sol_spent:.4f} SOL"
             elif stable_spent > 0:
                 payment = f" | -{stable_spent:.2f} USDC/USDT"
+            strength = buyer.get("buyer_strength", "normal")
+            strength_label = {"strong": "💪 stark", "dust": "🫧 Dust", "normal": "✓ normal"}.get(strength, "✓ normal")
+            early_rank = buyer.get("early_rank")
+            rank_label = f" | Early #{early_rank}" if early_rank else ""
             text += (
                 f"   {index}. "
                 f"{short_wallet}"
                 f" | +{amount:.4f} Token"
-                f"{payment}\n"
+                f"{payment} | {strength_label}{rank_label}\n"
             )
 
         else:
@@ -2265,7 +2292,8 @@ def format_per_coin_buyer_diag(stats):
         lines.append(
             f"• {row.get('name','?')} ({row.get('symbol','?')}): "
             f"Sig {row.get('signatures',0)} | TX {row.get('transactions',0)}/{row.get('tx_attempted',0)} | "
-            f"Wallets {row.get('wallet_candidates',0)} | Swap-Buyer {row.get('swap_verified',0)} | {market} | {gate}"
+            f"Wallets {row.get('wallet_candidates',0)} | Swap-Buyer {row.get('swap_verified',0)} "
+            f"| Stark {row.get('strong_buyers',0)} | Dust {row.get('dust_buyers',0)} | {market} | {gate}"
         )
     return "\n".join(lines)
 
@@ -2297,6 +2325,7 @@ def format_diagnostics(stats):
         f"↳ Signatur-Fehler: {stats.get('buyer_diag', {}).get('sig_errors', 0)} | TX-Fehler: {stats.get('buyer_diag', {}).get('tx_errors', 0)}\n"
         f"Wallet-Kandidaten: {stats.get('buyer_diag', {}).get('wallet_candidates', 0)} | Token-Zuflüsse: {stats.get('buyer_diag', {}).get('token_inflows', 0)}\n"
         f"Verifizierte Swap-Buyer: {stats.get('buyer_diag', {}).get('swap_verified', 0)} | Ohne Zahlungsleg verworfen: {stats.get('buyer_diag', {}).get('rejected_no_payment', 0)}\n"
+        f"Buyer-Qualität: Stark {stats.get('buyer_diag', {}).get('strong_buyers', 0)} | Normal/Meaningful {stats.get('buyer_diag', {}).get('meaningful_buyers', 0)} | Dust {stats.get('buyer_diag', {}).get('dust_buyers', 0)}\n"
         f"Ohne ≥2 Buyer verworfen: {stats.get('buyer_diag', {}).get('rejected_no_buyers', 0)}"
         + format_per_coin_buyer_diag(stats)
         + f"\n⏱ Watchdog: Stage={stats.get('watchdog', {}).get('stage', '-')} | Kandidaten-Timeouts={stats.get('watchdog', {}).get('candidate_timeouts', 0)} | Fehler={stats.get('watchdog', {}).get('candidate_errors', 0)}"
