@@ -31,6 +31,12 @@ Discovery pipeline fix: cache is loaded before network calls, providers are isol
 - Precheck-only pairs can never appear as TOP-EARLY or trigger an alert.
 - Goal: exercise Solana signature/transaction parsing even when the strict market filter has zero candidates.
 
-## v3.5.3
+## v3.5.4
 - Per-coin buyer diagnostics: signatures, parsed/attempted TXs, wallet candidates, verified swap buyers, market/precheck status, and buyer-gate result.
 - Keeps the verified-buyer gate and discovery behavior from v3.5.2 unchanged.
+
+
+## v3.5.4 Ultra-Early Precheck
+- Solana pools younger than MIN_PAIR_AGE_MINUTES may enter the diagnostic buyer precheck even before liquidity/volume mature.
+- Ultra-early precheck remains diagnostic-only and can never generate EARLY ALERT/TOP-EARLY unless the strict market gate passes.
+- Maximum diagnostic precheck remains capped at 3, prioritizing the youngest ultra-early pools.

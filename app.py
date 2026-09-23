@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.5.3-pro-per-coin-buyer-diagnostics"
+APP_VERSION = "3.5.4-pro-ultra-early-precheck"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -777,7 +777,7 @@ async def discover_candidates():
         "too_new": 0, "too_old": 0, "liq_low": 0, "liq_high": 0,
         "vol_low": 0, "vol_high": 0, "txns_low": 0,
         "price_change_high": 0, "meme_filter": 0, "passed": 0,
-        "pair_errors": 0, "buyer_precheck": 0,
+        "pair_errors": 0, "buyer_precheck": 0, "ultra_early_precheck": 0,
         "source_health": {"pipeline": "started"},
     }
     source_health = stats["source_health"]
@@ -880,12 +880,21 @@ async def discover_candidates():
                     # Buyer precheck: inspect a small set of young Solana pairs even when the
                     # strict market gate rejects them. They can NEVER become an alert unless
                     # strict_pass is true later in perform_scan.
-                    precheck_pass = (chain == "solana" and age_hours <= 24 and liquidity >= 1000 and volume >= 1000 and total >= 10 and meme_signal(name,symbol))
+                    # Diagnostic precheck. Ultra-new Solana pools (< MIN_PAIR_AGE_MINUTES)
+                    # are intentionally allowed through even before liquidity/volume mature.
+                    # This path can NEVER alert because strict_market_pass remains False.
+                    is_ultra_new = chain == "solana" and age_hours * 60 < MIN_PAIR_AGE_MINUTES
+                    regular_precheck = (chain == "solana" and age_hours <= 24 and liquidity >= 1000 and volume >= 1000 and total >= 10 and meme_signal(name,symbol))
+                    ultra_precheck = is_ultra_new and total >= 1
+                    precheck_pass = regular_precheck or ultra_precheck
                     if not strict_pass and not precheck_pass:
                         continue
-                    candidates.append({"chain":chain,"address":token_address,"pair_address":pair_address,"name":name,"symbol":symbol,"liquidity":liquidity,"volume":volume,"buys":buys,"sells":sells,"txns":total,"price_change":price_change,"age_hours":age_hours,"price_usd":clean_number(pair.get("priceUsd")),"url":pair.get("url"),"strict_market_pass":strict_pass,"buyer_precheck_only":not strict_pass})
-                    if strict_pass: stats["passed"] += 1
-                    else: stats["buyer_precheck"] += 1
+                    candidates.append({"chain":chain,"address":token_address,"pair_address":pair_address,"name":name,"symbol":symbol,"liquidity":liquidity,"volume":volume,"buys":buys,"sells":sells,"txns":total,"price_change":price_change,"age_hours":age_hours,"price_usd":clean_number(pair.get("priceUsd")),"url":pair.get("url"),"strict_market_pass":strict_pass,"buyer_precheck_only":not strict_pass,"ultra_early_precheck":bool(ultra_precheck and not strict_pass)})
+                    if strict_pass:
+                        stats["passed"] += 1
+                    else:
+                        stats["buyer_precheck"] += 1
+                        if ultra_precheck: stats["ultra_early_precheck"] += 1
                 except Exception:
                     stats["pair_errors"] += 1
 
@@ -893,7 +902,7 @@ async def discover_candidates():
     for c in candidates:
         unique.setdefault((c["chain"],c["pair_address"]),c)
     strict = [c for c in unique.values() if c.get("strict_market_pass")]
-    precheck = sorted([c for c in unique.values() if c.get("buyer_precheck_only")], key=lambda c: c.get("age_hours", 999))[:3]
+    precheck = sorted([c for c in unique.values() if c.get("buyer_precheck_only")], key=lambda c: (0 if c.get("ultra_early_precheck") else 1, c.get("age_hours", 999)))[:3]
     stats["passed_unique"] = len(strict)
     stats["buyer_precheck_selected"] = len(precheck)
     return strict + precheck, stats
@@ -2217,6 +2226,7 @@ def format_diagnostics(stats):
         f"Fehlende Daten/Alter: {stats.get('missing_data', 0) + stats.get('age_missing', 0)}\n"
         f"Blockiert: {stats.get('blocked', 0)}\n"
         f"Zu neu: {stats.get('too_new', 0)} | Zu alt: {stats.get('too_old', 0)}\n"
+        f"Ultra-Early Precheck: {stats.get('ultra_early_precheck', 0)} | Precheck ausgewählt: {stats.get('buyer_precheck_selected', 0)}\n"
         f"Liquidität zu niedrig/hoch: {stats.get('liq_low', 0)}/{stats.get('liq_high', 0)}\n"
         f"Volumen zu niedrig/hoch: {stats.get('vol_low', 0)}/{stats.get('vol_high', 0)}\n"
         f"Zu wenig Txns: {stats.get('txns_low', 0)}\n"
