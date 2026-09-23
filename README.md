@@ -47,3 +47,7 @@ Discovery pipeline fix: cache is loaded before network calls, providers are isol
 - Any otherwise valid Solana pair younger than `MIN_PAIR_AGE_MINUTES` can enter the capped diagnostic precheck.
 - Ultra-early candidates remain diagnostic-only; strict market pass + verified buyer gate are still required for alerts.
 - Precheck remains capped at 3 and prioritizes ultra-early pairs first.
+
+
+## v3.5.9 Strong Buyer Gate
+Alerts require at least 2 verified swap buyers and at least 2 non-Dust (meaningful) buyers. Dust activity remains visible in diagnostics but cannot satisfy the quality gate. Precheck-only pairs remain non-alerting.

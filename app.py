@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.5.8-pro-token-dedupe-precheck-selection"
+APP_VERSION = "3.5.9-pro-strong-buyer-gate"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -1731,7 +1731,8 @@ async def solana_early_buyers(session, candidate):
         return result
 
     ordered = sorted(found.values(), key=lambda x: x.get("block_time") or 0)
-    # Buyer intelligence is diagnostic only: the existing >=2 verified-buyer gate stays unchanged.
+    # Buyer intelligence feeds the alert-quality gate in v3.5.9.
+    # A verified Dust buyer remains visible, but does not count as meaningful for alert eligibility.
     # Thresholds are deliberately simple and transparent; they do not imply profitability.
     for rank, row in enumerate(ordered, 1):
         sol = float(row.get("sol_spent", 0) or 0)
@@ -1968,7 +1969,7 @@ async def perform_scan(progress=None):
         return {"checked": 0, "analyzed": 0, "candidates": [], "diagnostics": diagnostics}
 
     analyzed = []
-    buyer_diag = {"rejected_no_buyers": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0, "tx_attempted": 0, "tx_skipped": 0, "wallet_candidates": 0, "token_inflows": 0, "swap_verified": 0, "rejected_no_payment": 0, "strong_buyers": 0, "dust_buyers": 0, "meaningful_buyers": 0, "per_coin": []}
+    buyer_diag = {"rejected_no_buyers": 0, "rejected_quality": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0, "tx_attempted": 0, "tx_skipped": 0, "wallet_candidates": 0, "token_inflows": 0, "swap_verified": 0, "rejected_no_payment": 0, "strong_buyers": 0, "dust_buyers": 0, "meaningful_buyers": 0, "per_coin": []}
 
     for idx, candidate in enumerate(raw, 1):
         await report(f"Buyer-Analyse {idx}/{len(raw)}")
@@ -2011,7 +2012,9 @@ async def perform_scan(progress=None):
             "dust_buyers": int(eb.get("dust_buyers", 0) or 0),
             "meaningful_buyers": int(eb.get("meaningful_buyers", 0) or 0),
             "buyer_count": bc,
-            "gate": "PASS" if bc >= 2 else "REJECT",
+            "buyer_gate": "PASS" if bc >= 2 else "REJECT",
+            "quality_gate": "PASS" if int(eb.get("meaningful_buyers", 0) or 0) >= 2 else "REJECT",
+            "gate": "PASS" if (bc >= 2 and int(eb.get("meaningful_buyers", 0) or 0) >= 2) else "REJECT",
         })
         buyer_diag["rpc_errors"] += len(errs)
         buyer_diag["rpc_429"] += sum("HTTP 429" in e for e in errs)
@@ -2020,6 +2023,9 @@ async def perform_scan(progress=None):
         buyer_diag["tx_errors"] += sum("getTransaction" in e for e in errs)
         if bc < 2:
             buyer_diag["rejected_no_buyers"] += 1
+            continue
+        if int(eb.get("meaningful_buyers", 0) or 0) < 2:
+            buyer_diag["rejected_quality"] += 1
             continue
         # A precheck-only pair is diagnostic only and can never enter TOP-EARLY.
         if result.get("strict_market_pass") and result["score"] >= ALERT_SCORE:
@@ -2173,11 +2179,30 @@ def verified_buyer_wallets(candidate):
     return wallets
 
 
-def is_verified_early_candidate(candidate):
+def buyer_gate_status(candidate):
+    """Two-stage buyer gate: concrete verified wallets + buyer quality.
+
+    Dust buyers stay visible in diagnostics but cannot by themselves make an
+    alert eligible.  We require at least two non-Dust (normal/strong) verified
+    buyers, avoiding a single normal buyer + tiny Dust trade from passing.
+    """
     eb = candidate.get("early_buyers") or {}
     wallets = verified_buyer_wallets(candidate)
-    # Never trust a stale/derived count more than the concrete wallet list.
-    return int(eb.get("buyer_count", 0) or 0) >= 2 and len(wallets) >= 2
+    verified_count = min(int(eb.get("buyer_count", 0) or 0), len(wallets))
+    meaningful = int(eb.get("meaningful_buyers", 0) or 0)
+    buyer_pass = verified_count >= 2
+    quality_pass = meaningful >= 2
+    return {
+        "verified_count": verified_count,
+        "meaningful_count": meaningful,
+        "buyer_pass": buyer_pass,
+        "quality_pass": quality_pass,
+        "pass": buyer_pass and quality_pass,
+    }
+
+
+def is_verified_early_candidate(candidate):
+    return buyer_gate_status(candidate)["pass"]
 
 
 # ============================================================
@@ -2317,11 +2342,14 @@ def format_per_coin_buyer_diag(stats):
     for row in rows[:8]:
         market = "Markt✓" if row.get("strict_market_pass") else "Precheck"
         gate = "Gate✓" if row.get("gate") == "PASS" else "Gate✗"
+        buyer_gate = "Buyer✓" if row.get("buyer_gate") == "PASS" else "Buyer✗"
+        quality_gate = "Qualität✓" if row.get("quality_gate") == "PASS" else "Qualität✗"
         lines.append(
             f"• {row.get('name','?')} ({row.get('symbol','?')}): "
             f"Sig {row.get('signatures',0)} | TX {row.get('transactions',0)}/{row.get('tx_attempted',0)} | "
             f"Wallets {row.get('wallet_candidates',0)} | Swap-Buyer {row.get('swap_verified',0)} "
-            f"| Stark {row.get('strong_buyers',0)} | Dust {row.get('dust_buyers',0)} | {market} | {gate}"
+            f"| Meaningful {row.get('meaningful_buyers',0)} | Stark {row.get('strong_buyers',0)} | Dust {row.get('dust_buyers',0)} "
+            f"| {market} | {buyer_gate} | {quality_gate} | {gate}"
         )
     return "\n".join(lines)
 
@@ -2354,7 +2382,7 @@ def format_diagnostics(stats):
         f"Wallet-Kandidaten: {stats.get('buyer_diag', {}).get('wallet_candidates', 0)} | Token-Zuflüsse: {stats.get('buyer_diag', {}).get('token_inflows', 0)}\n"
         f"Verifizierte Swap-Buyer: {stats.get('buyer_diag', {}).get('swap_verified', 0)} | Ohne Zahlungsleg verworfen: {stats.get('buyer_diag', {}).get('rejected_no_payment', 0)}\n"
         f"Buyer-Qualität: Stark {stats.get('buyer_diag', {}).get('strong_buyers', 0)} | Normal/Meaningful {stats.get('buyer_diag', {}).get('meaningful_buyers', 0)} | Dust {stats.get('buyer_diag', {}).get('dust_buyers', 0)}\n"
-        f"Ohne ≥2 Buyer verworfen: {stats.get('buyer_diag', {}).get('rejected_no_buyers', 0)}"
+        f"Ohne ≥2 Buyer verworfen: {stats.get('buyer_diag', {}).get('rejected_no_buyers', 0)} | Qualitäts-Gate verworfen: {stats.get('buyer_diag', {}).get('rejected_quality', 0)}"
         + format_per_coin_buyer_diag(stats)
         + f"\n⏱ Watchdog: Stage={stats.get('watchdog', {}).get('stage', '-')} | Kandidaten-Timeouts={stats.get('watchdog', {}).get('candidate_timeouts', 0)} | Fehler={stats.get('watchdog', {}).get('candidate_errors', 0)}"
     )
