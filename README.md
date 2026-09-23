@@ -40,3 +40,10 @@ Discovery pipeline fix: cache is loaded before network calls, providers are isol
 - Solana pools younger than MIN_PAIR_AGE_MINUTES may enter the diagnostic buyer precheck even before liquidity/volume mature.
 - Ultra-early precheck remains diagnostic-only and can never generate EARLY ALERT/TOP-EARLY unless the strict market gate passes.
 - Maximum diagnostic precheck remains capped at 3, prioritizing the youngest ultra-early pools.
+
+
+## v3.5.5 Ultra-Early Selection Fix
+- Fixes ultra-new Solana selection when provider/cache 24h transaction counters are still zero or missing.
+- Any otherwise valid Solana pair younger than `MIN_PAIR_AGE_MINUTES` can enter the capped diagnostic precheck.
+- Ultra-early candidates remain diagnostic-only; strict market pass + verified buyer gate are still required for alerts.
+- Precheck remains capped at 3 and prioritizes ultra-early pairs first.

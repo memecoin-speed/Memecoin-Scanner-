@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.5.4-pro-ultra-early-precheck"
+APP_VERSION = "3.5.5-pro-ultra-early-selection-fix"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -885,7 +885,11 @@ async def discover_candidates():
                     # This path can NEVER alert because strict_market_pass remains False.
                     is_ultra_new = chain == "solana" and age_hours * 60 < MIN_PAIR_AGE_MINUTES
                     regular_precheck = (chain == "solana" and age_hours <= 24 and liquidity >= 1000 and volume >= 1000 and total >= 10 and meme_signal(name,symbol))
-                    ultra_precheck = is_ultra_new and total >= 1
+                    # Ultra-early pools often have incomplete/lagging 24h txn stats in
+                    # cached/provider payloads. Requiring total >= 1 here prevented exactly
+                    # those pools counted as `too_new` from ever reaching the buyer precheck.
+                    # Pair/token addresses are sufficient for the on-chain diagnostic stage.
+                    ultra_precheck = is_ultra_new
                     precheck_pass = regular_precheck or ultra_precheck
                     if not strict_pass and not precheck_pass:
                         continue
