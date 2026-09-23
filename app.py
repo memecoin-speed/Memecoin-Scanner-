@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.4.6-pro-discovery-pipeline-fix"
+APP_VERSION = "3.4.7-pro-solana-fast-path"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -108,7 +108,9 @@ SOLANA_SIGNATURE_LIMIT = int(os.getenv("SOLANA_SIGNATURE_LIMIT", "20"))
 RPC_CALL_TIMEOUT = int(os.getenv("RPC_CALL_TIMEOUT", "6"))
 CANDIDATE_ANALYSIS_TIMEOUT = int(os.getenv("CANDIDATE_ANALYSIS_TIMEOUT", "28"))
 DISCOVERY_STAGE_TIMEOUT = int(os.getenv("DISCOVERY_STAGE_TIMEOUT", "40"))
-SOLANA_DIRECT_LIMIT = int(os.getenv("SOLANA_DIRECT_LIMIT", "25"))
+SOLANA_DIRECT_LIMIT = int(os.getenv("SOLANA_DIRECT_LIMIT", "12"))
+SOLANA_DIRECT_SIGS_PER_PROGRAM = int(os.getenv("SOLANA_DIRECT_SIGS_PER_PROGRAM", "6"))
+SOLANA_DIRECT_TX_LIMIT = int(os.getenv("SOLANA_DIRECT_TX_LIMIT", "10"))
 SOLANA_DIRECT_TTL_SECONDS = int(os.getenv("SOLANA_DIRECT_TTL_SECONDS", "900"))
 solana_direct_signatures = {}
 SOLANA_RPC_FALLBACKS = [x.strip() for x in os.getenv(
@@ -627,37 +629,76 @@ def _extract_mints_from_parsed_tx(tx):
     return list(dict.fromkeys(mints))
 
 async def get_direct_solana_pairs(session):
-    """Discover token mints from recent AMM/launch-program transactions via Solana RPC.
-    Market enrichment is best-effort; 429s never erase the on-chain discovery diagnostics.
+    """Fast Solana discovery path.
+
+    Keep the live scan small: fetch a few recent signatures per launch/AMM program,
+    parse only a bounded number of transactions concurrently, then enrich only the
+    first fresh mints. This is intentionally incremental; successful pairs are
+    persisted by discover_candidates and reused on later scans.
     """
     now = time.time()
-    # Merge signatures captured by WS with recent signatures queried directly from each program.
-    sigs = [(sig, ts) for sig, ts in solana_direct_signatures.items() if now-ts <= SOLANA_DIRECT_TTL_SECONDS]
+    sigs = [(sig, ts) for sig, ts in solana_direct_signatures.items()
+            if now-ts <= SOLANA_DIRECT_TTL_SECONDS]
     health=[]
-    for program in SOLANA_PROGRAM_IDS:
-        rows, source, errors = await solana_rpc_with_fallback(session, "getSignaturesForAddress", [program,{"limit":SOLANA_DIRECT_LIMIT}])
+
+    async def fetch_program(program):
+        rows, source, errors = await solana_rpc_with_fallback(
+            session, "getSignaturesForAddress",
+            [program,{"limit":SOLANA_DIRECT_SIGS_PER_PROGRAM}])
+        return program, rows, errors
+
+    program_results = await asyncio.gather(
+        *(fetch_program(p) for p in SOLANA_PROGRAM_IDS), return_exceptions=True)
+    for item in program_results:
+        if isinstance(item, Exception):
+            health.append("program:error"); continue
+        program, rows, errors = item
         if isinstance(rows,list):
             health.append(f"{program[:5]}:ok:{len(rows)}")
             for r in rows:
                 sig=r.get("signature"); bt=r.get("blockTime") or int(now)
                 if sig and now-bt <= SOLANA_DIRECT_TTL_SECONDS: sigs.append((sig,bt))
-        else: health.append(f"{program[:5]}:rpc-error")
-    sigs=list(dict.fromkeys(sigs))[:SOLANA_DIRECT_LIMIT*len(SOLANA_PROGRAM_IDS)]
+        else:
+            health.append(f"{program[:5]}:rpc-error")
+
+    # Deduplicate while preserving newest-first input order.
+    dedup=[]; seen=set()
+    for sig,ts in sigs:
+        if sig not in seen:
+            seen.add(sig); dedup.append((sig,ts))
+    sigs=dedup[:SOLANA_DIRECT_TX_LIMIT]
+
+    async def fetch_tx(sig):
+        tx, source, errors = await solana_rpc_with_fallback(
+            session,"getTransaction",
+            [sig,{"encoding":"jsonParsed","maxSupportedTransactionVersion":0,"commitment":"confirmed"}])
+        return tx
+
+    txs = await asyncio.gather(*(fetch_tx(sig) for sig,_ in sigs), return_exceptions=True)
     mints=[]
-    for sig,_ in sigs:
-        tx, source, errors = await solana_rpc_with_fallback(session,"getTransaction",[sig,{"encoding":"jsonParsed","maxSupportedTransactionVersion":0,"commitment":"confirmed"}])
+    for tx in txs:
+        if isinstance(tx, Exception): continue
         for mint in _extract_mints_from_parsed_tx(tx):
             if mint not in mints: mints.append(mint)
+            if len(mints)>=SOLANA_DIRECT_LIMIT: break
         if len(mints)>=SOLANA_DIRECT_LIMIT: break
-    pairs=[]; enrich429=0
-    for mint in mints[:SOLANA_DIRECT_LIMIT]:
+
+    # Enrich a small batch concurrently. Each call is bounded again here so a
+    # throttled DexScreener endpoint cannot consume the whole Solana stage.
+    enrich429=0
+    async def enrich_mint(mint):
         try:
-            got=await get_token_pairs(session,"solana",mint)
-            if got: pairs.extend(got)
-        except Exception as exc:
-            if "429" in str(exc): enrich429+=1
-        await asyncio.sleep(.25)
-    return pairs, {"signatures":len(sigs),"mints":len(mints),"pairs":len(pairs),"enrich429":enrich429,"rpc":";".join(health)}
+            return await asyncio.wait_for(get_token_pairs(session,"solana",mint), timeout=2.2)
+        except asyncio.TimeoutError:
+            return []
+        except Exception:
+            return []
+    enriched = await asyncio.gather(*(enrich_mint(m) for m in mints[:8])) if mints else []
+    pairs=[]
+    for got in enriched:
+        if got: pairs.extend(got)
+    return pairs, {"signatures":len(sigs),"mints":len(mints),"pairs":len(pairs),
+                   "enrich429":enrich429,"rpc":";".join(health)}
 
 async def discover_candidates():
     """Fault-isolated discovery pipeline. Diagnostics and cache are always populated."""
@@ -698,7 +739,7 @@ async def discover_candidates():
             asyncio.create_task(safe("gecko_solana", get_gecko_new_pools(session,"solana","solana"), 6, ([],"timeout"))),
             asyncio.create_task(safe("gecko_ethereum", get_gecko_new_pools(session,"eth","ethereum"), 6, ([],"timeout"))),
             asyncio.create_task(safe("dex", get_discovery_profiles(session), 8, ([],{}))),
-            asyncio.create_task(safe("solana_direct", get_direct_solana_pairs(session), 8, ([],{"signatures":0,"mints":0,"pairs":0,"enrich429":0,"rpc":"timeout"}))),
+            asyncio.create_task(safe("solana_direct", get_direct_solana_pairs(session), 12, ([],{"signatures":0,"mints":0,"pairs":0,"enrich429":0,"rpc":"timeout"}))),
         ]
         sol_res, eth_res, dex_res, direct_res = await asyncio.gather(*tasks)
         (sol_pack, sol_err), (eth_pack, eth_err), (dex_pack, dex_err), (direct_pack, direct_err) = sol_res, eth_res, dex_res, direct_res
