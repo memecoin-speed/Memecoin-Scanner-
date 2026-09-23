@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.5.0-pro-buyer-pipeline"
+APP_VERSION = "3.5.1-pro-buyer-gate-display-fix"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -1835,11 +1835,7 @@ async def perform_scan(progress=None):
     analyzed.sort(key=lambda x: (x["score"], x["early_buyers"]["buyer_count"], -x["age_hours"]), reverse=True)
     verified = []
     for item in analyzed:
-        eb = item.get("early_buyers") or {}
-        buyers = eb.get("buyers") or []
-        buyer_count = int(eb.get("buyer_count", 0) or 0)
-        unique_wallets = {str(b.get("wallet", "")).strip() for b in buyers if isinstance(b, dict) and str(b.get("wallet", "")).strip()}
-        if buyer_count >= 2 and len(unique_wallets) >= 2:
+        if is_verified_early_candidate(item):
             verified.append(item)
 
     await report("Auswertung fertig")
@@ -1957,6 +1953,29 @@ def candidate_keyboard(candidate):
     return InlineKeyboardMarkup([[InlineKeyboardButton(f"🧪 Paper Buy ${PAPER_AMOUNT_USD:.0f}", callback_data=f"paper:{candidate['pair_address']}")]])
 
 
+def verified_buyer_wallets(candidate):
+    """Return unique concrete buyer wallets from the on-chain result only."""
+    eb = candidate.get("early_buyers") or {}
+    seen = set()
+    wallets = []
+    for buyer in eb.get("buyers") or []:
+        if not isinstance(buyer, dict):
+            continue
+        wallet = str(buyer.get("wallet", "")).strip()
+        if not wallet or wallet in seen:
+            continue
+        seen.add(wallet)
+        wallets.append(wallet)
+    return wallets
+
+
+def is_verified_early_candidate(candidate):
+    eb = candidate.get("early_buyers") or {}
+    wallets = verified_buyer_wallets(candidate)
+    # Never trust a stale/derived count more than the concrete wallet list.
+    return int(eb.get("buyer_count", 0) or 0) >= 2 and len(wallets) >= 2
+
+
 # ============================================================
 # FORMAT CANDIDATE
 # ============================================================
@@ -1966,8 +1985,7 @@ def format_candidate(
     candidate
 ):
     eb = candidate.get("early_buyers") or {}
-    wallets = {str(b.get("wallet", "")).strip() for b in (eb.get("buyers") or []) if isinstance(b, dict) and str(b.get("wallet", "")).strip()}
-    if int(eb.get("buyer_count", 0) or 0) < 2 or len(wallets) < 2:
+    if not is_verified_early_candidate(candidate):
         raise ValueError("unverified candidate blocked from TOP-EARLY output")
 
     age = candidate[
@@ -2008,7 +2026,7 @@ def format_candidate(
         f"{candidate['price_change']:.2f}%\n"
         f"   👥 Aktivität: "
         f"{candidate['txns']} Txns\n"
-        f"   {format_early_buyers(candidate)}\n"
+        f"   {format_early_buyers(eb)}\n"
         f"   ⚠️ Markt-Risiken: "
         f"{candidate['market_risk']}\n"
         f"   🔐 On-Chain Risiko: "
@@ -2119,11 +2137,7 @@ def format_diagnostics(stats):
 async def _send_scan_result(message, result):
     checked = result["checked"]
     candidates = result["candidates"]
-    candidates = [
-        c for c in candidates
-        if int((c.get("early_buyers") or {}).get("buyer_count", 0) or 0) >= 2
-        and len({str(b.get("wallet", "")).strip() for b in ((c.get("early_buyers") or {}).get("buyers") or []) if isinstance(b, dict) and str(b.get("wallet", "")).strip()}) >= 2
-    ]
+    candidates = [c for c in candidates if is_verified_early_candidate(c)]
     diagnostic_text = format_diagnostics(result.get("diagnostics", {}))
     if not candidates:
         text = ("✅ Scan abgeschlossen.\n\n" f"🔎 Geprüft: {checked}\n" "🚨 Kandidaten: 0\n\n" "❌ Keine passenden Early-Kandidaten gefunden." + diagnostic_text)
@@ -2348,7 +2362,7 @@ async def scanner_loop(
                     buyers = candidate["early_buyers"]["buyer_count"]
                     print("[CANDIDATE]", candidate["name"], candidate["symbol"], candidate["chain"], "Score=", candidate["score"], "EarlyBuyers=", buyers)
                     if (AUTO_ALERT and ALLOWED_CHAT_ID
-                            and int((candidate.get("early_buyers") or {}).get("buyer_count", 0) or 0) >= 2
+                            and is_verified_early_candidate(candidate)
                             and alert_is_due(candidate)):
                         try:
                             await application.bot.send_message(
