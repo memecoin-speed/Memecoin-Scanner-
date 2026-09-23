@@ -18,3 +18,9 @@ Discovery pipeline fix: cache is loaded before network calls, providers are isol
 - RPC calls are parallelized within the existing semaphore limits.
 - Solana mint enrichment is bounded per token so one slow provider cannot stall discovery.
 - Successful pairs continue to be persisted in SQLite for later scans.
+
+## v3.4.8 Buyer Precheck
+- Up to 3 young Solana pairs can enter a relaxed diagnostic buyer precheck.
+- The normal market filters remain unchanged for real alerts.
+- Precheck-only pairs can never appear as TOP-EARLY or trigger an alert.
+- Goal: exercise Solana signature/transaction parsing even when the strict market filter has zero candidates.

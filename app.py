@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.4.7-pro-solana-fast-path"
+APP_VERSION = "3.4.8-pro-buyer-precheck"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -710,7 +710,7 @@ async def discover_candidates():
         "too_new": 0, "too_old": 0, "liq_low": 0, "liq_high": 0,
         "vol_low": 0, "vol_high": 0, "txns_low": 0,
         "price_change_high": 0, "meme_filter": 0, "passed": 0,
-        "pair_errors": 0,
+        "pair_errors": 0, "buyer_precheck": 0,
         "source_health": {"pipeline": "started"},
     }
     source_health = stats["source_health"]
@@ -798,25 +798,38 @@ async def discover_candidates():
                     tx=(pair.get("txns") or {}).get("h24") or {}; buys=int(clean_number(tx.get("buys"))); sells=int(clean_number(tx.get("sells"))); total=buys+sells
                     price_change=clean_number((pair.get("priceChange") or {}).get("h24")); age_hours=pair_age_hours(pair)
                     if age_hours is None: stats["age_missing"] += 1; continue
-                    if age_hours*60 < MIN_PAIR_AGE_MINUTES: stats["too_new"] += 1; continue
-                    if age_hours > MAX_PAIR_AGE_HOURS: stats["too_old"] += 1; continue
-                    if liquidity < MIN_LIQUIDITY_USD: stats["liq_low"] += 1; continue
-                    if liquidity > MAX_LIQUIDITY_USD: stats["liq_high"] += 1; continue
-                    if volume < MIN_VOLUME_24H: stats["vol_low"] += 1; continue
-                    if volume > MAX_VOLUME_24H: stats["vol_high"] += 1; continue
-                    if total < MIN_TXNS_24H: stats["txns_low"] += 1; continue
-                    if price_change > MAX_PRICE_CHANGE_24H: stats["price_change_high"] += 1; continue
-                    if not meme_signal(name,symbol): stats["meme_filter"] += 1; continue
-                    candidates.append({"chain":chain,"address":token_address,"pair_address":pair_address,"name":name,"symbol":symbol,"liquidity":liquidity,"volume":volume,"buys":buys,"sells":sells,"txns":total,"price_change":price_change,"age_hours":age_hours,"price_usd":clean_number(pair.get("priceUsd")),"url":pair.get("url")})
-                    stats["passed"] += 1
+                    # Strict market gate remains unchanged for real TOP-EARLY alerts.
+                    strict_pass = True
+                    if age_hours*60 < MIN_PAIR_AGE_MINUTES: stats["too_new"] += 1; strict_pass = False
+                    elif age_hours > MAX_PAIR_AGE_HOURS: stats["too_old"] += 1; strict_pass = False
+                    elif liquidity < MIN_LIQUIDITY_USD: stats["liq_low"] += 1; strict_pass = False
+                    elif liquidity > MAX_LIQUIDITY_USD: stats["liq_high"] += 1; strict_pass = False
+                    elif volume < MIN_VOLUME_24H: stats["vol_low"] += 1; strict_pass = False
+                    elif volume > MAX_VOLUME_24H: stats["vol_high"] += 1; strict_pass = False
+                    elif total < MIN_TXNS_24H: stats["txns_low"] += 1; strict_pass = False
+                    elif price_change > MAX_PRICE_CHANGE_24H: stats["price_change_high"] += 1; strict_pass = False
+                    elif not meme_signal(name,symbol): stats["meme_filter"] += 1; strict_pass = False
+
+                    # Buyer precheck: inspect a small set of young Solana pairs even when the
+                    # strict market gate rejects them. They can NEVER become an alert unless
+                    # strict_pass is true later in perform_scan.
+                    precheck_pass = (chain == "solana" and age_hours <= 24 and liquidity >= 1000 and volume >= 1000 and total >= 10 and meme_signal(name,symbol))
+                    if not strict_pass and not precheck_pass:
+                        continue
+                    candidates.append({"chain":chain,"address":token_address,"pair_address":pair_address,"name":name,"symbol":symbol,"liquidity":liquidity,"volume":volume,"buys":buys,"sells":sells,"txns":total,"price_change":price_change,"age_hours":age_hours,"price_usd":clean_number(pair.get("priceUsd")),"url":pair.get("url"),"strict_market_pass":strict_pass,"buyer_precheck_only":not strict_pass})
+                    if strict_pass: stats["passed"] += 1
+                    else: stats["buyer_precheck"] += 1
                 except Exception:
                     stats["pair_errors"] += 1
 
     unique={}
     for c in candidates:
         unique.setdefault((c["chain"],c["pair_address"]),c)
-    stats["passed_unique"]=len(unique)
-    return list(unique.values()), stats
+    strict = [c for c in unique.values() if c.get("strict_market_pass")]
+    precheck = sorted([c for c in unique.values() if c.get("buyer_precheck_only")], key=lambda c: c.get("age_hours", 999))[:3]
+    stats["passed_unique"] = len(strict)
+    stats["buyer_precheck_selected"] = len(precheck)
+    return strict + precheck, stats
 
 
 
@@ -1746,7 +1759,8 @@ async def perform_scan(progress=None):
         if bc < 2:
             buyer_diag["rejected_no_buyers"] += 1
             continue
-        if result["score"] >= ALERT_SCORE:
+        # A precheck-only pair is diagnostic only and can never enter TOP-EARLY.
+        if result.get("strict_market_pass") and result["score"] >= ALERT_SCORE:
             analyzed.append(result)
 
     analyzed.sort(key=lambda x: (x["score"], x["early_buyers"]["buyer_count"], -x["age_hours"]), reverse=True)
