@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.5.2-pro-verified-buyers"
+APP_VERSION = "3.5.3-pro-per-coin-buyer-diagnostics"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -1859,7 +1859,7 @@ async def perform_scan(progress=None):
         return {"checked": 0, "analyzed": 0, "candidates": [], "diagnostics": diagnostics}
 
     analyzed = []
-    buyer_diag = {"rejected_no_buyers": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0, "tx_attempted": 0, "tx_skipped": 0, "wallet_candidates": 0, "token_inflows": 0, "swap_verified": 0, "rejected_no_payment": 0}
+    buyer_diag = {"rejected_no_buyers": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0, "tx_attempted": 0, "tx_skipped": 0, "wallet_candidates": 0, "token_inflows": 0, "swap_verified": 0, "rejected_no_payment": 0, "per_coin": []}
 
     for idx, candidate in enumerate(raw, 1):
         await report(f"Buyer-Analyse {idx}/{len(raw)}")
@@ -1885,6 +1885,19 @@ async def perform_scan(progress=None):
         buyer_diag["swap_verified"] += int(eb.get("swap_verified", 0) or 0)
         buyer_diag["rejected_no_payment"] += int(eb.get("rejected_no_payment", 0) or 0)
         errs = eb.get("rpc_errors", []) or []
+        buyer_diag["per_coin"].append({
+            "name": result.get("name") or result.get("symbol") or "?",
+            "symbol": result.get("symbol") or "?",
+            "strict_market_pass": bool(result.get("strict_market_pass")),
+            "signatures": int(eb.get("signatures_found", 0) or 0),
+            "tx_attempted": int(eb.get("tx_attempted", 0) or 0),
+            "transactions": int(eb.get("transactions_parsed", 0) or 0),
+            "wallet_candidates": int(eb.get("wallet_candidates", 0) or 0),
+            "token_inflows": int(eb.get("token_inflows", 0) or 0),
+            "swap_verified": int(eb.get("swap_verified", 0) or 0),
+            "buyer_count": bc,
+            "gate": "PASS" if bc >= 2 else "REJECT",
+        })
         buyer_diag["rpc_errors"] += len(errs)
         buyer_diag["rpc_429"] += sum("HTTP 429" in e for e in errs)
         buyer_diag["rpc_timeout"] += sum("timeout" in e.lower() for e in errs)
@@ -2177,6 +2190,22 @@ async def status(
     )
 
 
+def format_per_coin_buyer_diag(stats):
+    rows = stats.get("buyer_diag", {}).get("per_coin", []) or []
+    if not rows:
+        return "\nCoin-Details: keine Buyer-Analyse ausgeführt"
+    lines = ["\nCoin-Details:"]
+    for row in rows[:8]:
+        market = "Markt✓" if row.get("strict_market_pass") else "Precheck"
+        gate = "Gate✓" if row.get("gate") == "PASS" else "Gate✗"
+        lines.append(
+            f"• {row.get('name','?')} ({row.get('symbol','?')}): "
+            f"Sig {row.get('signatures',0)} | TX {row.get('transactions',0)}/{row.get('tx_attempted',0)} | "
+            f"Wallets {row.get('wallet_candidates',0)} | Swap-Buyer {row.get('swap_verified',0)} | {market} | {gate}"
+        )
+    return "\n".join(lines)
+
+
 def format_diagnostics(stats):
     return (
         "\n\n🧪 Discovery-Diagnose:\n"
@@ -2204,6 +2233,7 @@ def format_diagnostics(stats):
         f"Wallet-Kandidaten: {stats.get('buyer_diag', {}).get('wallet_candidates', 0)} | Token-Zuflüsse: {stats.get('buyer_diag', {}).get('token_inflows', 0)}\n"
         f"Verifizierte Swap-Buyer: {stats.get('buyer_diag', {}).get('swap_verified', 0)} | Ohne Zahlungsleg verworfen: {stats.get('buyer_diag', {}).get('rejected_no_payment', 0)}\n"
         f"Ohne ≥2 Buyer verworfen: {stats.get('buyer_diag', {}).get('rejected_no_buyers', 0)}"
+        + format_per_coin_buyer_diag(stats)
         + f"\n⏱ Watchdog: Stage={stats.get('watchdog', {}).get('stage', '-')} | Kandidaten-Timeouts={stats.get('watchdog', {}).get('candidate_timeouts', 0)} | Fehler={stats.get('watchdog', {}).get('candidate_errors', 0)}"
     )
 

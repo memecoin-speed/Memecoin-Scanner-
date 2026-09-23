@@ -30,3 +30,7 @@ Discovery pipeline fix: cache is loaded before network calls, providers are isol
 - The normal market filters remain unchanged for real alerts.
 - Precheck-only pairs can never appear as TOP-EARLY or trigger an alert.
 - Goal: exercise Solana signature/transaction parsing even when the strict market filter has zero candidates.
+
+## v3.5.3
+- Per-coin buyer diagnostics: signatures, parsed/attempted TXs, wallet candidates, verified swap buyers, market/precheck status, and buyer-gate result.
+- Keeps the verified-buyer gate and discovery behavior from v3.5.2 unchanged.
