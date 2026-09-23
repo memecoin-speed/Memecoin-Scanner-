@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.5.1-pro-buyer-gate-display-fix"
+APP_VERSION = "3.5.2-pro-verified-buyers"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -1484,20 +1484,27 @@ async def solana_rpc_with_fallback(session, method, params):
 
 
 async def solana_early_buyers(session, candidate):
-    """Fast, bounded Solana buyer pipeline.
+    """Bounded Solana buyer pipeline with swap-like verification.
 
-    Signature lookups for pool + mint run concurrently. Transaction fetches are
-    bounded and concurrent; a slow/null transaction is skipped instead of
-    failing the whole candidate.
+    A wallet is only promoted from a token-receiver candidate to a verified
+    buyer when the same transaction shows target-token inflow AND either
+    native SOL spend or stablecoin spend by that wallet. This intentionally
+    rejects plain token transfers and most pool/program balance movements.
     """
     result = {
         "buyers": [], "buyer_count": 0, "earliest_minutes": None,
         "status": "⚪ Keine Daten", "rpc_source": None, "rpc_errors": [],
         "signatures_found": 0, "transactions_parsed": 0,
         "tx_attempted": 0, "tx_skipped": 0,
+        "wallet_candidates": 0, "token_inflows": 0,
+        "swap_verified": 0, "rejected_no_payment": 0,
     }
     pair = candidate.get("pair_address") or ""
     mint = candidate.get("address") or ""
+    stable_mints = {
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+    }
 
     async def fetch_sigs(address):
         if not address:
@@ -1547,6 +1554,8 @@ async def solana_early_buyers(session, candidate):
 
     tx_results = await asyncio.gather(*(fetch_tx(info) for info in signature_infos))
     found = {}
+    wallet_candidates = set()
+
     for signature_info, tx, source, errors in tx_results:
         result["rpc_errors"].extend(errors or [])
         if source: result["rpc_source"] = source
@@ -1556,24 +1565,76 @@ async def solana_early_buyers(session, candidate):
         result["transactions_parsed"] += 1
         meta = tx.get("meta") or {}
         if meta.get("err"): continue
+
         pre = token_balance_map(meta.get("preTokenBalances"), mint)
         post = token_balance_map(meta.get("postTokenBalances"), mint)
         block_time = tx.get("blockTime") or signature_info.get("blockTime")
         signature = signature_info.get("signature")
+
+        # Parse account keys + signer status for native SOL spend verification.
+        message = ((tx.get("transaction") or {}).get("message") or {})
+        raw_keys = message.get("accountKeys") or []
+        keys, signers = [], set()
+        for item in raw_keys:
+            if isinstance(item, dict):
+                pubkey = str(item.get("pubkey") or "")
+                if pubkey:
+                    keys.append(pubkey)
+                    if item.get("signer"): signers.add(pubkey)
+            else:
+                keys.append(str(item))
+        pre_lamports = meta.get("preBalances") or []
+        post_lamports = meta.get("postBalances") or []
+        sol_spend = {}
+        for i, wallet in enumerate(keys):
+            if i < len(pre_lamports) and i < len(post_lamports):
+                delta = (post_lamports[i] - pre_lamports[i]) / 1_000_000_000
+                if delta < -0.000005:
+                    sol_spend[wallet] = -delta
+
+        # Stablecoin spend by owner in the same transaction.
+        stable_spend = {}
+        for smint in stable_mints:
+            spre = token_balance_map(meta.get("preTokenBalances"), smint)
+            spost = token_balance_map(meta.get("postTokenBalances"), smint)
+            for owner in set(spre) | set(spost):
+                delta = spost.get(owner, 0) - spre.get(owner, 0)
+                if delta < 0:
+                    stable_spend[owner] = stable_spend.get(owner, 0) + (-delta)
+
         for owner in set(pre) | set(post):
             delta = post.get(owner, 0) - pre.get(owner, 0)
             if delta <= 0 or not owner: continue
             if pair and owner.lower() == pair.lower(): continue
+            wallet_candidates.add(owner)
+            result["token_inflows"] += 1
+
+            # Require wallet authority/signature plus visible payment leg.
+            paid_sol = sol_spend.get(owner, 0)
+            paid_stable = stable_spend.get(owner, 0)
+            if owner not in signers or (paid_sol <= 0 and paid_stable <= 0):
+                result["rejected_no_payment"] += 1
+                continue
+
             current = found.get(owner)
+            row = {
+                "wallet": owner, "amount": delta, "block_time": block_time,
+                "signature": signature, "sol_spent": paid_sol,
+                "stable_spent": paid_stable, "verified_swap": True,
+            }
             if current is None:
-                found[owner] = {"wallet":owner, "amount":delta, "block_time":block_time, "signature":signature}
+                found[owner] = row
             else:
                 current["amount"] += delta
+                current["sol_spent"] += paid_sol
+                current["stable_spent"] += paid_stable
                 if block_time and (not current.get("block_time") or block_time < current["block_time"]):
                     current["block_time"] = block_time; current["signature"] = signature
 
+    result["wallet_candidates"] = len(wallet_candidates)
+    result["swap_verified"] = len(found)
     if not found:
-        result["status"] = "⚪ Transaktionen da, aber keine Käufer-Wallets erkannt" if result["transactions_parsed"] else "🟠 Transaktions-RPC ohne verwertbare Daten"
+        result["status"] = "⚪ Token-Zuflüsse erkannt, aber keine verifizierten Käufe" if result["token_inflows"] else ("⚪ Transaktionen da, aber keine Käufer-Wallets erkannt" if result["transactions_parsed"] else "🟠 Transaktions-RPC ohne verwertbare Daten")
         return result
 
     ordered = sorted(found.values(), key=lambda x: x.get("block_time") or 0)
@@ -1581,7 +1642,7 @@ async def solana_early_buyers(session, candidate):
     result["buyer_count"] = len(ordered)
     earliest = next((x.get("block_time") for x in ordered if x.get("block_time")), None)
     if earliest: result["earliest_minutes"] = max(0, int((time.time() - earliest) / 60))
-    result["status"] = "🟢 Frühe Wallet-Käufer on-chain erkannt"
+    result["status"] = "🟢 Verifizierte frühe Swap-Käufer erkannt"
     return result
 
 
@@ -1798,7 +1859,7 @@ async def perform_scan(progress=None):
         return {"checked": 0, "analyzed": 0, "candidates": [], "diagnostics": diagnostics}
 
     analyzed = []
-    buyer_diag = {"rejected_no_buyers": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0, "tx_attempted": 0, "tx_skipped": 0}
+    buyer_diag = {"rejected_no_buyers": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0, "tx_attempted": 0, "tx_skipped": 0, "wallet_candidates": 0, "token_inflows": 0, "swap_verified": 0, "rejected_no_payment": 0}
 
     for idx, candidate in enumerate(raw, 1):
         await report(f"Buyer-Analyse {idx}/{len(raw)}")
@@ -1819,6 +1880,10 @@ async def perform_scan(progress=None):
         buyer_diag["transactions"] += int(eb.get("transactions_parsed", 0) or 0)
         buyer_diag["tx_attempted"] += int(eb.get("tx_attempted", 0) or 0)
         buyer_diag["tx_skipped"] += int(eb.get("tx_skipped", 0) or 0)
+        buyer_diag["wallet_candidates"] += int(eb.get("wallet_candidates", 0) or 0)
+        buyer_diag["token_inflows"] += int(eb.get("token_inflows", 0) or 0)
+        buyer_diag["swap_verified"] += int(eb.get("swap_verified", 0) or 0)
+        buyer_diag["rejected_no_payment"] += int(eb.get("rejected_no_payment", 0) or 0)
         errs = eb.get("rpc_errors", []) or []
         buyer_diag["rpc_errors"] += len(errs)
         buyer_diag["rpc_429"] += sum("HTTP 429" in e for e in errs)
@@ -1905,11 +1970,18 @@ def format_early_buyers(
         )
 
         if amount is not None:
-
+            payment = ""
+            sol_spent = float(buyer.get("sol_spent", 0) or 0)
+            stable_spent = float(buyer.get("stable_spent", 0) or 0)
+            if sol_spent > 0:
+                payment = f" | -{sol_spent:.4f} SOL"
+            elif stable_spent > 0:
+                payment = f" | -{stable_spent:.2f} USDC/USDT"
             text += (
                 f"   {index}. "
                 f"{short_wallet}"
-                f" | +{amount:.4f} Token\n"
+                f" | +{amount:.4f} Token"
+                f"{payment}\n"
             )
 
         else:
@@ -2129,6 +2201,8 @@ def format_diagnostics(stats):
         f"RPC-Fehler: {stats.get('buyer_diag', {}).get('rpc_errors', 0)}\n"
         f"↳ 429: {stats.get('buyer_diag', {}).get('rpc_429', 0)} | Timeouts: {stats.get('buyer_diag', {}).get('rpc_timeout', 0)}\n"
         f"↳ Signatur-Fehler: {stats.get('buyer_diag', {}).get('sig_errors', 0)} | TX-Fehler: {stats.get('buyer_diag', {}).get('tx_errors', 0)}\n"
+        f"Wallet-Kandidaten: {stats.get('buyer_diag', {}).get('wallet_candidates', 0)} | Token-Zuflüsse: {stats.get('buyer_diag', {}).get('token_inflows', 0)}\n"
+        f"Verifizierte Swap-Buyer: {stats.get('buyer_diag', {}).get('swap_verified', 0)} | Ohne Zahlungsleg verworfen: {stats.get('buyer_diag', {}).get('rejected_no_payment', 0)}\n"
         f"Ohne ≥2 Buyer verworfen: {stats.get('buyer_diag', {}).get('rejected_no_buyers', 0)}"
         + f"\n⏱ Watchdog: Stage={stats.get('watchdog', {}).get('stage', '-')} | Kandidaten-Timeouts={stats.get('watchdog', {}).get('candidate_timeouts', 0)} | Fehler={stats.get('watchdog', {}).get('candidate_errors', 0)}"
     )
