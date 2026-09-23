@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.4.8-pro-buyer-precheck"
+APP_VERSION = "3.4.9-pro-direct-solana-pools"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -628,6 +628,62 @@ def _extract_mints_from_parsed_tx(tx):
                 mints.append(mint)
     return list(dict.fromkeys(mints))
 
+
+async def get_raydium_pairs_for_mint(session, mint):
+    """Resolve a discovered Solana mint to Raydium pools without DexScreener.
+    Uses Raydium API v3 /pools/info/mint and normalizes results to the scanner pair shape.
+    """
+    url = "https://api-v3.raydium.io/pools/info/mint"
+    params = {"mint1": mint, "poolType": "all", "poolSortField": "liquidity",
+              "sortType": "desc", "pageSize": "5", "page": "1"}
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=3.5),
+                               headers={"Accept":"application/json","User-Agent":f"MemecoinScanner/{APP_VERSION}"}) as r:
+            if r.status != 200:
+                return [], f"http:{r.status}"
+            body = await r.json(content_type=None)
+    except asyncio.TimeoutError:
+        return [], "timeout"
+    except Exception as exc:
+        return [], f"error:{type(exc).__name__}"
+    if not isinstance(body, dict) or not body.get("success"):
+        return [], "api_error"
+    data = body.get("data") or {}
+    rows = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(rows, list): rows = []
+    out=[]
+    for row in rows:
+        if not isinstance(row, dict): continue
+        ma=row.get("mintA") or {}; mb=row.get("mintB") or {}
+        a_addr=ma.get("address") or ma.get("mint") or row.get("mintAAddress")
+        b_addr=mb.get("address") or mb.get("mint") or row.get("mintBAddress")
+        base = ma if a_addr == mint else (mb if b_addr == mint else ma)
+        base_addr = base.get("address") or base.get("mint") or mint
+        day=row.get("day") or row.get("stats24h") or {}
+        vol=day.get("volume") if isinstance(day,dict) else None
+        if vol is None: vol=row.get("volume24h") or row.get("volume24H") or 0
+        txc=day.get("txCount") if isinstance(day,dict) else None
+        if txc is None: txc=row.get("txCount24h") or row.get("txCount") or 0
+        buys=(day.get("buyCount") or day.get("buys") or 0) if isinstance(day,dict) else 0
+        sells=(day.get("sellCount") or day.get("sells") or 0) if isinstance(day,dict) else 0
+        if not buys and not sells and txc: buys=int(float(txc)//2); sells=int(float(txc)-buys)
+        open_time=row.get("openTime") or row.get("startTime") or row.get("createdAt")
+        if isinstance(open_time,(int,float)):
+            created_ms=int(open_time*1000 if open_time < 10_000_000_000 else open_time)
+        else:
+            created_ms=int(time.time()*1000)
+        out.append({
+            "chainId":"solana", "pairAddress":row.get("id") or row.get("poolId") or row.get("address"),
+            "baseToken":{"address":base_addr,"name":base.get("name") or base.get("symbol") or "Unknown",
+                         "symbol":base.get("symbol") or "UNKNOWN"},
+            "liquidity":{"usd":row.get("tvl") or row.get("liquidity") or 0},
+            "volume":{"h24":vol or 0}, "txns":{"h24":{"buys":buys,"sells":sells}},
+            "priceChange":{"h24": (day.get("priceChange") or day.get("priceChangePercent") or 0) if isinstance(day,dict) else 0},
+            "pairCreatedAt":created_ms, "priceUsd":row.get("price") or base.get("price") or 0,
+            "url":f"https://raydium.io/swap/?inputMint=sol&outputMint={base_addr}", "_source":"raydium_v3"
+        })
+    return [x for x in out if x.get("pairAddress")], f"ok:{len(out)}"
+
 async def get_direct_solana_pairs(session):
     """Fast Solana discovery path.
 
@@ -683,12 +739,17 @@ async def get_direct_solana_pairs(session):
             if len(mints)>=SOLANA_DIRECT_LIMIT: break
         if len(mints)>=SOLANA_DIRECT_LIMIT: break
 
-    # Enrich a small batch concurrently. Each call is bounded again here so a
-    # throttled DexScreener endpoint cannot consume the whole Solana stage.
-    enrich429=0
+    # Resolve mints directly through Raydium API v3 first. DexScreener is only a fallback.
+    # This breaks the previous dependency where direct on-chain discovery still needed
+    # DexScreener before it could create a usable pair.
+    enrich429=0; ray_health=[]
     async def enrich_mint(mint):
+        ray_pairs, rh = await get_raydium_pairs_for_mint(session, mint)
+        ray_health.append(rh)
+        if ray_pairs:
+            return ray_pairs
         try:
-            return await asyncio.wait_for(get_token_pairs(session,"solana",mint), timeout=2.2)
+            return await asyncio.wait_for(get_token_pairs(session,"solana",mint), timeout=1.8)
         except asyncio.TimeoutError:
             return []
         except Exception:
@@ -697,8 +758,14 @@ async def get_direct_solana_pairs(session):
     pairs=[]
     for got in enriched:
         if got: pairs.extend(got)
+    # de-duplicate pool addresses
+    uniq={}
+    for pair in pairs:
+        if isinstance(pair,dict) and pair.get("pairAddress"):
+            uniq.setdefault(pair.get("pairAddress"),pair)
+    pairs=list(uniq.values())
     return pairs, {"signatures":len(sigs),"mints":len(mints),"pairs":len(pairs),
-                   "enrich429":enrich429,"rpc":";".join(health)}
+                   "enrich429":enrich429,"raydium":";".join(ray_health[:8]),"rpc":";".join(health)}
 
 async def discover_candidates():
     """Fault-isolated discovery pipeline. Diagnostics and cache are always populated."""
@@ -751,7 +818,7 @@ async def discover_candidates():
         source_health["gecko_solana"] = sol_err or sol_health
         source_health["gecko_ethereum"] = eth_err or eth_health
         source_health["dex_watchdog"] = dex_err or "ok"
-        source_health["solana_direct"] = direct_err or f"sigs:{direct_health.get('signatures',0)} mints:{direct_health.get('mints',0)} pairs:{direct_health.get('pairs',0)} enrich429:{direct_health.get('enrich429',0)}"
+        source_health["solana_direct"] = direct_err or f"sigs:{direct_health.get('signatures',0)} mints:{direct_health.get('mints',0)} pairs:{direct_health.get('pairs',0)} ray:{direct_health.get('raydium','n/a')} enrich429:{direct_health.get('enrich429',0)}"
         stats["profiles"] = len(profiles or [])
         live_pairs = (direct_sol or []) + (sol_gt or []) + (eth_gt or [])
 

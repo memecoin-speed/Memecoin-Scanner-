@@ -1,3 +1,9 @@
+# Memecoin Scanner v3.4.9 Pro Direct Solana Pools
+
+Direct Solana discovery now resolves discovered mints through Raydium API v3 `/pools/info/mint` before falling back to DexScreener. This is intended to turn on-chain `mints` into usable `pairs` even when DexScreener/Gecko are rate limited.
+
+Safety: paper trading only; no private keys or automatic real-money execution.
+
 # Memecoin Scanner v3.4.4 Pro Fast Discovery
 
 - Fast/fault-isolated discovery: DexScreener, GeckoTerminal and Solana Direct run independently.
