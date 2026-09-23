@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.4.9-pro-direct-solana-pools"
+APP_VERSION = "3.5.0-pro-buyer-pipeline"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -104,9 +104,9 @@ MAX_PRICE_CHANGE_24H = 500
 
 EARLY_BUYER_WINDOW_HOURS = 24
 
-SOLANA_SIGNATURE_LIMIT = int(os.getenv("SOLANA_SIGNATURE_LIMIT", "20"))
-RPC_CALL_TIMEOUT = int(os.getenv("RPC_CALL_TIMEOUT", "6"))
-CANDIDATE_ANALYSIS_TIMEOUT = int(os.getenv("CANDIDATE_ANALYSIS_TIMEOUT", "28"))
+SOLANA_SIGNATURE_LIMIT = int(os.getenv("SOLANA_SIGNATURE_LIMIT", "8"))
+RPC_CALL_TIMEOUT = int(os.getenv("RPC_CALL_TIMEOUT", "4"))
+CANDIDATE_ANALYSIS_TIMEOUT = int(os.getenv("CANDIDATE_ANALYSIS_TIMEOUT", "24"))
 DISCOVERY_STAGE_TIMEOUT = int(os.getenv("DISCOVERY_STAGE_TIMEOUT", "40"))
 SOLANA_DIRECT_LIMIT = int(os.getenv("SOLANA_DIRECT_LIMIT", "12"))
 SOLANA_DIRECT_SIGS_PER_PROGRAM = int(os.getenv("SOLANA_DIRECT_SIGS_PER_PROGRAM", "6"))
@@ -1484,25 +1484,39 @@ async def solana_rpc_with_fallback(session, method, params):
 
 
 async def solana_early_buyers(session, candidate):
+    """Fast, bounded Solana buyer pipeline.
+
+    Signature lookups for pool + mint run concurrently. Transaction fetches are
+    bounded and concurrent; a slow/null transaction is skipped instead of
+    failing the whole candidate.
+    """
     result = {
         "buyers": [], "buyer_count": 0, "earliest_minutes": None,
         "status": "⚪ Keine Daten", "rpc_source": None, "rpc_errors": [],
         "signatures_found": 0, "transactions_parsed": 0,
+        "tx_attempted": 0, "tx_skipped": 0,
     }
     pair = candidate.get("pair_address") or ""
     mint = candidate.get("address") or ""
 
-    signature_infos, seen = [], set()
-    for address in (pair, mint):
+    async def fetch_sigs(address):
         if not address:
-            continue
-        rows, source, errors = await solana_rpc_with_fallback(
-            session, "getSignaturesForAddress",
-            [address, {"limit": SOLANA_SIGNATURE_LIMIT, "commitment": "confirmed"}],
-        )
-        result["rpc_errors"].extend(errors)
-        if source:
-            result["rpc_source"] = source
+            return [], None, []
+        try:
+            return await asyncio.wait_for(
+                solana_rpc_with_fallback(
+                    session, "getSignaturesForAddress",
+                    [address, {"limit": SOLANA_SIGNATURE_LIMIT, "commitment": "confirmed"}],
+                ), timeout=max(5, RPC_CALL_TIMEOUT + 2)
+            )
+        except asyncio.TimeoutError:
+            return [], None, ["getSignaturesForAddress:stage_timeout"]
+
+    sig_results = await asyncio.gather(*(fetch_sigs(a) for a in (pair, mint) if a))
+    signature_infos, seen = [], set()
+    for rows, source, errors in sig_results:
+        result["rpc_errors"].extend(errors or [])
+        if source: result["rpc_source"] = source
         for row in rows or []:
             sig = row.get("signature")
             if sig and sig not in seen:
@@ -1510,42 +1524,46 @@ async def solana_early_buyers(session, candidate):
 
     result["signatures_found"] = len(signature_infos)
     if not signature_infos:
-        if result["rpc_errors"]:
-            result["status"] = "🟠 Solana-RPC ohne verwertbare Daten"
-        else:
-            result["status"] = "⚪ Keine Pool-/Token-Transaktionen"
+        result["status"] = "🟠 Solana-RPC ohne verwertbare Daten" if result["rpc_errors"] else "⚪ Keine Pool-/Token-Transaktionen"
         return result
 
     signature_infos.sort(key=lambda x: x.get("blockTime") or 0)
-    # Watchdog: inspect only the earliest bounded set; one hot token must not stall the scan.
     signature_infos = signature_infos[:SOLANA_SIGNATURE_LIMIT]
+    result["tx_attempted"] = len(signature_infos)
+
+    async def fetch_tx(info):
+        sig = info.get("signature")
+        if not sig: return info, None, None, []
+        try:
+            tx, source, errors = await asyncio.wait_for(
+                solana_rpc_with_fallback(
+                    session, "getTransaction",
+                    [sig, {"encoding":"jsonParsed", "commitment":"confirmed", "maxSupportedTransactionVersion":0}],
+                ), timeout=max(5, RPC_CALL_TIMEOUT + 2)
+            )
+            return info, tx, source, errors
+        except asyncio.TimeoutError:
+            return info, None, None, ["getTransaction:stage_timeout"]
+
+    tx_results = await asyncio.gather(*(fetch_tx(info) for info in signature_infos))
     found = {}
-    for signature_info in signature_infos:
-        signature = signature_info.get("signature")
-        if not signature:
-            continue
-        tx, source, errors = await solana_rpc_with_fallback(
-            session, "getTransaction",
-            [signature, {"encoding":"jsonParsed", "commitment":"confirmed", "maxSupportedTransactionVersion":0}],
-        )
-        result["rpc_errors"].extend(errors)
-        if source:
-            result["rpc_source"] = source
+    for signature_info, tx, source, errors in tx_results:
+        result["rpc_errors"].extend(errors or [])
+        if source: result["rpc_source"] = source
         if not tx:
+            result["tx_skipped"] += 1
             continue
         result["transactions_parsed"] += 1
         meta = tx.get("meta") or {}
-        if meta.get("err"):
-            continue
+        if meta.get("err"): continue
         pre = token_balance_map(meta.get("preTokenBalances"), mint)
         post = token_balance_map(meta.get("postTokenBalances"), mint)
         block_time = tx.get("blockTime") or signature_info.get("blockTime")
+        signature = signature_info.get("signature")
         for owner in set(pre) | set(post):
             delta = post.get(owner, 0) - pre.get(owner, 0)
-            if delta <= 0 or not owner:
-                continue
-            if pair and owner.lower() == pair.lower():
-                continue
+            if delta <= 0 or not owner: continue
+            if pair and owner.lower() == pair.lower(): continue
             current = found.get(owner)
             if current is None:
                 found[owner] = {"wallet":owner, "amount":delta, "block_time":block_time, "signature":signature}
@@ -1553,18 +1571,16 @@ async def solana_early_buyers(session, candidate):
                 current["amount"] += delta
                 if block_time and (not current.get("block_time") or block_time < current["block_time"]):
                     current["block_time"] = block_time; current["signature"] = signature
-        await asyncio.sleep(0.03)
 
     if not found:
-        result["status"] = "⚪ Transaktionen da, aber keine Käufer-Wallets erkannt"
+        result["status"] = "⚪ Transaktionen da, aber keine Käufer-Wallets erkannt" if result["transactions_parsed"] else "🟠 Transaktions-RPC ohne verwertbare Daten"
         return result
 
     ordered = sorted(found.values(), key=lambda x: x.get("block_time") or 0)
     result["buyers"] = ordered[:10]
     result["buyer_count"] = len(ordered)
     earliest = next((x.get("block_time") for x in ordered if x.get("block_time")), None)
-    if earliest:
-        result["earliest_minutes"] = max(0, int((time.time() - earliest) / 60))
+    if earliest: result["earliest_minutes"] = max(0, int((time.time() - earliest) / 60))
     result["status"] = "🟢 Frühe Wallet-Käufer on-chain erkannt"
     return result
 
@@ -1717,33 +1733,17 @@ async def analyze_candidate(
 
     async with aiohttp.ClientSession() as session:
 
-        if candidate[
-            "chain"
-        ].lower() == "solana":
+        candidate["early_buyers"] = await early_buyer_analysis(session, candidate)
 
-            candidate[
-                "onchain_risk"
-            ] = await solana_risk_check(
-                session,
-                candidate[
-                    "address"
-                ]
-            )
-
+        if candidate["chain"].lower() == "solana":
+            try:
+                candidate["onchain_risk"] = await asyncio.wait_for(
+                    solana_risk_check(session, candidate["address"]), timeout=5
+                )
+            except asyncio.TimeoutError:
+                candidate["onchain_risk"] = "⚪ Nicht verfügbar (Timeout)"
         else:
-
-            candidate[
-                "onchain_risk"
-            ] = (
-                "⚪ Nicht verfügbar"
-            )
-
-        candidate[
-            "early_buyers"
-        ] = await early_buyer_analysis(
-            session,
-            candidate
-        )
+            candidate["onchain_risk"] = "⚪ Nicht verfügbar"
 
     # Bonus nur für tatsächlich
     # erkannte frühe Wallets.
@@ -1798,7 +1798,7 @@ async def perform_scan(progress=None):
         return {"checked": 0, "analyzed": 0, "candidates": [], "diagnostics": diagnostics}
 
     analyzed = []
-    buyer_diag = {"rejected_no_buyers": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0}
+    buyer_diag = {"rejected_no_buyers": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0, "tx_attempted": 0, "tx_skipped": 0}
 
     for idx, candidate in enumerate(raw, 1):
         await report(f"Buyer-Analyse {idx}/{len(raw)}")
@@ -1817,6 +1817,8 @@ async def perform_scan(progress=None):
         bc = int(eb.get("buyer_count", 0) or 0)
         buyer_diag["signatures"] += int(eb.get("signatures_found", 0) or 0)
         buyer_diag["transactions"] += int(eb.get("transactions_parsed", 0) or 0)
+        buyer_diag["tx_attempted"] += int(eb.get("tx_attempted", 0) or 0)
+        buyer_diag["tx_skipped"] += int(eb.get("tx_skipped", 0) or 0)
         errs = eb.get("rpc_errors", []) or []
         buyer_diag["rpc_errors"] += len(errs)
         buyer_diag["rpc_429"] += sum("HTTP 429" in e for e in errs)
@@ -2105,7 +2107,7 @@ def format_diagnostics(stats):
         f"Filter bestanden: {stats.get('passed_unique', stats.get('passed', 0))}\n"
         f"\n🔬 Buyer-Diagnose:\n"
         f"Signaturen geprüft: {stats.get('buyer_diag', {}).get('signatures', 0)}\n"
-        f"Transaktionen geparst: {stats.get('buyer_diag', {}).get('transactions', 0)}\n"
+        f"Transaktionen versucht/geparst/übersprungen: {stats.get('buyer_diag', {}).get('tx_attempted', 0)}/{stats.get('buyer_diag', {}).get('transactions', 0)}/{stats.get('buyer_diag', {}).get('tx_skipped', 0)}\n"
         f"RPC-Fehler: {stats.get('buyer_diag', {}).get('rpc_errors', 0)}\n"
         f"↳ 429: {stats.get('buyer_diag', {}).get('rpc_429', 0)} | Timeouts: {stats.get('buyer_diag', {}).get('rpc_timeout', 0)}\n"
         f"↳ Signatur-Fehler: {stats.get('buyer_diag', {}).get('sig_errors', 0)} | TX-Fehler: {stats.get('buyer_diag', {}).get('tx_errors', 0)}\n"
