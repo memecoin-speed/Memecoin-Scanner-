@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.6.0-pro-buyer-quality-accounting-fix"
+APP_VERSION = "3.6.1-pro-diagnostics-upgrade"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -1593,6 +1593,7 @@ async def solana_early_buyers(session, candidate):
         "wallet_candidates": 0, "token_inflows": 0,
         "swap_verified": 0, "rejected_no_payment": 0,
         "strong_buyers": 0, "normal_buyers": 0, "dust_buyers": 0, "meaningful_buyers": 0, "qualified_buyers": 0,
+        "tx_error_rpc": 0, "tx_error_null": 0, "tx_error_parse": 0, "tx_error_exception": 0, "tx_error_stage_timeout": 0,
     }
     pair = candidate.get("pair_address") or ""
     mint = candidate.get("address") or ""
@@ -1652,7 +1653,21 @@ async def solana_early_buyers(session, candidate):
     for signature_info, tx, source, errors in tx_results:
         result["rpc_errors"].extend(errors or [])
         if source: result["rpc_source"] = source
+        for err in (errors or []):
+            low = str(err).lower()
+            if "stage_timeout" in low:
+                result["tx_error_stage_timeout"] += 1
+            elif ":rpc " in low or ":http " in low:
+                result["tx_error_rpc"] += 1
+            elif "gettransaction:" in low:
+                result["tx_error_exception"] += 1
         if not tx:
+            result["tx_skipped"] += 1
+            if not errors:
+                result["tx_error_null"] += 1
+            continue
+        if not isinstance(tx, dict) or not isinstance(tx.get("transaction"), dict):
+            result["tx_error_parse"] += 1
             result["tx_skipped"] += 1
             continue
         result["transactions_parsed"] += 1
@@ -1973,7 +1988,7 @@ async def perform_scan(progress=None):
         return {"checked": 0, "analyzed": 0, "candidates": [], "diagnostics": diagnostics}
 
     analyzed = []
-    buyer_diag = {"rejected_no_buyers": 0, "rejected_quality": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0, "tx_attempted": 0, "tx_skipped": 0, "wallet_candidates": 0, "token_inflows": 0, "swap_verified": 0, "rejected_no_payment": 0, "strong_buyers": 0, "normal_buyers": 0, "dust_buyers": 0, "meaningful_buyers": 0, "qualified_buyers": 0, "per_coin": []}
+    buyer_diag = {"rejected_no_buyers": 0, "rejected_quality": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0, "tx_error_rpc": 0, "tx_error_null": 0, "tx_error_parse": 0, "tx_error_exception": 0, "tx_error_stage_timeout": 0, "tx_attempted": 0, "tx_skipped": 0, "wallet_candidates": 0, "token_inflows": 0, "swap_verified": 0, "rejected_no_payment": 0, "strong_buyers": 0, "normal_buyers": 0, "dust_buyers": 0, "meaningful_buyers": 0, "qualified_buyers": 0, "per_coin": []}
 
     for idx, candidate in enumerate(raw, 1):
         await report(f"Buyer-Analyse {idx}/{len(raw)}")
@@ -2029,6 +2044,11 @@ async def perform_scan(progress=None):
         buyer_diag["rpc_timeout"] += sum("timeout" in e.lower() for e in errs)
         buyer_diag["sig_errors"] += sum("getSignaturesForAddress" in e for e in errs)
         buyer_diag["tx_errors"] += sum("getTransaction" in e for e in errs)
+        buyer_diag["tx_error_rpc"] += int(eb.get("tx_error_rpc", 0) or 0)
+        buyer_diag["tx_error_null"] += int(eb.get("tx_error_null", 0) or 0)
+        buyer_diag["tx_error_parse"] += int(eb.get("tx_error_parse", 0) or 0)
+        buyer_diag["tx_error_exception"] += int(eb.get("tx_error_exception", 0) or 0)
+        buyer_diag["tx_error_stage_timeout"] += int(eb.get("tx_error_stage_timeout", 0) or 0)
         if bc < 2:
             buyer_diag["rejected_no_buyers"] += 1
             continue
@@ -2366,6 +2386,7 @@ def format_diagnostics(stats):
     return (
         "\n\n🧪 Discovery-Diagnose:\n"
         f"Discovery-Quellen: " + " | ".join(f"{k}={v}" for k, v in stats.get("source_health", {}).items()) + "\n"
+        f"Discovery-Timeouts: {sum(1 for v in stats.get('source_health', {}).values() if 'timeout' in str(v).lower())}\n"
         f"Profile geladen: {stats.get('profiles', 0)}\n"
         f"Pairs gefunden: {stats.get('pairs', 0)} "
         f"(SOL {stats.get('solana_pairs', 0)} | ETH {stats.get('ethereum_pairs', 0)})\n"
@@ -2387,6 +2408,7 @@ def format_diagnostics(stats):
         f"RPC-Fehler: {stats.get('buyer_diag', {}).get('rpc_errors', 0)}\n"
         f"↳ 429: {stats.get('buyer_diag', {}).get('rpc_429', 0)} | Timeouts: {stats.get('buyer_diag', {}).get('rpc_timeout', 0)}\n"
         f"↳ Signatur-Fehler: {stats.get('buyer_diag', {}).get('sig_errors', 0)} | TX-Fehler: {stats.get('buyer_diag', {}).get('tx_errors', 0)}\n"
+        f"↳ TX-Ursachen: RPC/HTTP {stats.get('buyer_diag', {}).get('tx_error_rpc', 0)} | Null/NotFound {stats.get('buyer_diag', {}).get('tx_error_null', 0)} | Parse/Unsupported {stats.get('buyer_diag', {}).get('tx_error_parse', 0)} | Exception {stats.get('buyer_diag', {}).get('tx_error_exception', 0)} | Stage-Timeout {stats.get('buyer_diag', {}).get('tx_error_stage_timeout', 0)}\n"
         f"Wallet-Kandidaten: {stats.get('buyer_diag', {}).get('wallet_candidates', 0)} | Token-Zuflüsse: {stats.get('buyer_diag', {}).get('token_inflows', 0)}\n"
         f"Verifizierte Swap-Buyer: {stats.get('buyer_diag', {}).get('swap_verified', 0)} | Ohne Zahlungsleg verworfen: {stats.get('buyer_diag', {}).get('rejected_no_payment', 0)}\n"
         f"Buyer-Qualität: Qualifiziert {stats.get('buyer_diag', {}).get('qualified_buyers', 0)} | Stark {stats.get('buyer_diag', {}).get('strong_buyers', 0)} | Normal {stats.get('buyer_diag', {}).get('normal_buyers', 0)} | Dust {stats.get('buyer_diag', {}).get('dust_buyers', 0)}\n"
