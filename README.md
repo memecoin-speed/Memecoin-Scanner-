@@ -55,3 +55,9 @@ Alerts require at least 2 verified swap buyers and at least 2 non-Dust (meaningf
 
 ## v3.6.0 Buyer Quality Accounting Fix
 Strong, Normal and Dust are now mutually exclusive buyer buckets. Qualified buyers are exactly Strong + Normal, and diagnostics show Qualified X/2 explicitly. Alert eligibility still requires at least two verified swap buyers and at least two qualified buyers.
+
+
+## v3.6.2
+- Bounded one-time retry for transient Solana getTransaction RPC/HTTP errors and local stage timeouts.
+- Buyer quality diagnostics now display qualified buyer count with the minimum explicitly.
+- Market filters, buyer-quality thresholds, and alert gates are unchanged.

@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.6.1-pro-diagnostics-upgrade"
+APP_VERSION = "3.6.2-pro-rpc-resilience-diagnostic-polish"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -1636,15 +1636,40 @@ async def solana_early_buyers(session, candidate):
 
     async def fetch_tx(info):
         sig = info.get("signature")
-        if not sig: return info, None, None, []
-        try:
-            tx, source, errors, _cached = await asyncio.wait_for(
-                solana_get_transaction_cached(session, sig),
-                timeout=max(5, RPC_CALL_TIMEOUT * 2 + 2)
-            )
-            return info, tx, source, errors
-        except asyncio.TimeoutError:
-            return info, None, None, ["getTransaction:stage_timeout"]
+        if not sig:
+            return info, None, None, []
+
+        # v3.6.2: one bounded resilience retry for transient RPC/HTTP failures
+        # or a local stage timeout. This does not increase buyer batch size and
+        # therefore keeps public-RPC pressure controlled.
+        collected_errors = []
+        for attempt in range(2):
+            try:
+                tx, source, errors, _cached = await asyncio.wait_for(
+                    solana_get_transaction_cached(session, sig),
+                    timeout=max(6, RPC_CALL_TIMEOUT * 2 + 2 + attempt * 2)
+                )
+                collected_errors.extend(errors or [])
+                if tx is not None:
+                    return info, tx, source, collected_errors
+
+                transient = any(
+                    (":http " in str(e).lower()) or (":rpc " in str(e).lower()) or
+                    ("timeout" in str(e).lower())
+                    for e in (errors or [])
+                )
+                if attempt == 0 and transient:
+                    await asyncio.sleep(0.45)
+                    continue
+                return info, None, source, collected_errors
+            except asyncio.TimeoutError:
+                collected_errors.append("getTransaction:stage_timeout")
+                if attempt == 0:
+                    await asyncio.sleep(0.45)
+                    continue
+                return info, None, None, collected_errors
+
+        return info, None, None, collected_errors
 
     tx_results = await asyncio.gather(*(fetch_tx(info) for info in signature_infos))
     found = {}
@@ -2376,7 +2401,7 @@ def format_per_coin_buyer_diag(stats):
             f"• {row.get('name','?')} ({row.get('symbol','?')}): "
             f"Sig {row.get('signatures',0)} | TX {row.get('transactions',0)}/{row.get('tx_attempted',0)} | "
             f"Wallets {row.get('wallet_candidates',0)} | Swap-Buyer {row.get('swap_verified',0)} "
-            f"| Qualifiziert {row.get('qualified_buyers',0)}/2 | Stark {row.get('strong_buyers',0)} | Normal {row.get('normal_buyers',0)} | Dust {row.get('dust_buyers',0)} "
+            f"| Qualifiziert: {row.get('qualified_buyers',0)} (Minimum: 2) | Stark {row.get('strong_buyers',0)} | Normal {row.get('normal_buyers',0)} | Dust {row.get('dust_buyers',0)} "
             f"| {market} | {buyer_gate} | {quality_gate} | {gate}"
         )
     return "\n".join(lines)
@@ -2411,7 +2436,7 @@ def format_diagnostics(stats):
         f"↳ TX-Ursachen: RPC/HTTP {stats.get('buyer_diag', {}).get('tx_error_rpc', 0)} | Null/NotFound {stats.get('buyer_diag', {}).get('tx_error_null', 0)} | Parse/Unsupported {stats.get('buyer_diag', {}).get('tx_error_parse', 0)} | Exception {stats.get('buyer_diag', {}).get('tx_error_exception', 0)} | Stage-Timeout {stats.get('buyer_diag', {}).get('tx_error_stage_timeout', 0)}\n"
         f"Wallet-Kandidaten: {stats.get('buyer_diag', {}).get('wallet_candidates', 0)} | Token-Zuflüsse: {stats.get('buyer_diag', {}).get('token_inflows', 0)}\n"
         f"Verifizierte Swap-Buyer: {stats.get('buyer_diag', {}).get('swap_verified', 0)} | Ohne Zahlungsleg verworfen: {stats.get('buyer_diag', {}).get('rejected_no_payment', 0)}\n"
-        f"Buyer-Qualität: Qualifiziert {stats.get('buyer_diag', {}).get('qualified_buyers', 0)} | Stark {stats.get('buyer_diag', {}).get('strong_buyers', 0)} | Normal {stats.get('buyer_diag', {}).get('normal_buyers', 0)} | Dust {stats.get('buyer_diag', {}).get('dust_buyers', 0)}\n"
+        f"Buyer-Qualität: Qualifiziert {stats.get('buyer_diag', {}).get('qualified_buyers', 0)} (Minimum pro Coin: 2) | Stark {stats.get('buyer_diag', {}).get('strong_buyers', 0)} | Normal {stats.get('buyer_diag', {}).get('normal_buyers', 0)} | Dust {stats.get('buyer_diag', {}).get('dust_buyers', 0)}\n"
         f"Ohne ≥2 Buyer verworfen: {stats.get('buyer_diag', {}).get('rejected_no_buyers', 0)} | Qualitäts-Gate verworfen: {stats.get('buyer_diag', {}).get('rejected_quality', 0)}"
         + format_per_coin_buyer_diag(stats)
         + f"\n⏱ Watchdog: Stage={stats.get('watchdog', {}).get('stage', '-')} | Kandidaten-Timeouts={stats.get('watchdog', {}).get('candidate_timeouts', 0)} | Fehler={stats.get('watchdog', {}).get('candidate_errors', 0)}"
