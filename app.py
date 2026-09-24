@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.5.9-pro-strong-buyer-gate"
+APP_VERSION = "3.6.0-pro-buyer-quality-accounting-fix"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -1592,7 +1592,7 @@ async def solana_early_buyers(session, candidate):
         "tx_attempted": 0, "tx_skipped": 0,
         "wallet_candidates": 0, "token_inflows": 0,
         "swap_verified": 0, "rejected_no_payment": 0,
-        "strong_buyers": 0, "dust_buyers": 0, "meaningful_buyers": 0,
+        "strong_buyers": 0, "normal_buyers": 0, "dust_buyers": 0, "meaningful_buyers": 0, "qualified_buyers": 0,
     }
     pair = candidate.get("pair_address") or ""
     mint = candidate.get("address") or ""
@@ -1744,10 +1744,14 @@ async def solana_early_buyers(session, candidate):
         elif sol >= 0.10 or stable >= 20:
             row["buyer_strength"] = "strong"
             result["strong_buyers"] += 1
-            result["meaningful_buyers"] += 1
+            result["qualified_buyers"] += 1
         else:
             row["buyer_strength"] = "normal"
-            result["meaningful_buyers"] += 1
+            result["normal_buyers"] += 1
+            result["qualified_buyers"] += 1
+    # Backward-compatible alias: meaningful now means exactly qualified (normal + strong),
+    # while Strong / Normal / Dust remain mutually exclusive accounting buckets.
+    result["meaningful_buyers"] = result["qualified_buyers"]
     result["buyers"] = ordered[:10]
     result["buyer_count"] = len(ordered)
     earliest = next((x.get("block_time") for x in ordered if x.get("block_time")), None)
@@ -1969,7 +1973,7 @@ async def perform_scan(progress=None):
         return {"checked": 0, "analyzed": 0, "candidates": [], "diagnostics": diagnostics}
 
     analyzed = []
-    buyer_diag = {"rejected_no_buyers": 0, "rejected_quality": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0, "tx_attempted": 0, "tx_skipped": 0, "wallet_candidates": 0, "token_inflows": 0, "swap_verified": 0, "rejected_no_payment": 0, "strong_buyers": 0, "dust_buyers": 0, "meaningful_buyers": 0, "per_coin": []}
+    buyer_diag = {"rejected_no_buyers": 0, "rejected_quality": 0, "signatures": 0, "transactions": 0, "rpc_errors": 0, "rpc_429": 0, "rpc_timeout": 0, "sig_errors": 0, "tx_errors": 0, "tx_attempted": 0, "tx_skipped": 0, "wallet_candidates": 0, "token_inflows": 0, "swap_verified": 0, "rejected_no_payment": 0, "strong_buyers": 0, "normal_buyers": 0, "dust_buyers": 0, "meaningful_buyers": 0, "qualified_buyers": 0, "per_coin": []}
 
     for idx, candidate in enumerate(raw, 1):
         await report(f"Buyer-Analyse {idx}/{len(raw)}")
@@ -1995,6 +1999,8 @@ async def perform_scan(progress=None):
         buyer_diag["swap_verified"] += int(eb.get("swap_verified", 0) or 0)
         buyer_diag["rejected_no_payment"] += int(eb.get("rejected_no_payment", 0) or 0)
         buyer_diag["strong_buyers"] += int(eb.get("strong_buyers", 0) or 0)
+        buyer_diag["normal_buyers"] += int(eb.get("normal_buyers", 0) or 0)
+        buyer_diag["qualified_buyers"] += int(eb.get("qualified_buyers", eb.get("meaningful_buyers", 0)) or 0)
         buyer_diag["dust_buyers"] += int(eb.get("dust_buyers", 0) or 0)
         buyer_diag["meaningful_buyers"] += int(eb.get("meaningful_buyers", 0) or 0)
         errs = eb.get("rpc_errors", []) or []
@@ -2009,12 +2015,14 @@ async def perform_scan(progress=None):
             "token_inflows": int(eb.get("token_inflows", 0) or 0),
             "swap_verified": int(eb.get("swap_verified", 0) or 0),
             "strong_buyers": int(eb.get("strong_buyers", 0) or 0),
+            "normal_buyers": int(eb.get("normal_buyers", 0) or 0),
             "dust_buyers": int(eb.get("dust_buyers", 0) or 0),
             "meaningful_buyers": int(eb.get("meaningful_buyers", 0) or 0),
+            "qualified_buyers": int(eb.get("qualified_buyers", eb.get("meaningful_buyers", 0)) or 0),
             "buyer_count": bc,
             "buyer_gate": "PASS" if bc >= 2 else "REJECT",
-            "quality_gate": "PASS" if int(eb.get("meaningful_buyers", 0) or 0) >= 2 else "REJECT",
-            "gate": "PASS" if (bc >= 2 and int(eb.get("meaningful_buyers", 0) or 0) >= 2) else "REJECT",
+            "quality_gate": "PASS" if int(eb.get("qualified_buyers", eb.get("meaningful_buyers", 0)) or 0) >= 2 else "REJECT",
+            "gate": "PASS" if (bc >= 2 and int(eb.get("qualified_buyers", eb.get("meaningful_buyers", 0)) or 0) >= 2) else "REJECT",
         })
         buyer_diag["rpc_errors"] += len(errs)
         buyer_diag["rpc_429"] += sum("HTTP 429" in e for e in errs)
@@ -2024,7 +2032,7 @@ async def perform_scan(progress=None):
         if bc < 2:
             buyer_diag["rejected_no_buyers"] += 1
             continue
-        if int(eb.get("meaningful_buyers", 0) or 0) < 2:
+        if int(eb.get("qualified_buyers", eb.get("meaningful_buyers", 0)) or 0) < 2:
             buyer_diag["rejected_quality"] += 1
             continue
         # A precheck-only pair is diagnostic only and can never enter TOP-EARLY.
@@ -2189,7 +2197,7 @@ def buyer_gate_status(candidate):
     eb = candidate.get("early_buyers") or {}
     wallets = verified_buyer_wallets(candidate)
     verified_count = min(int(eb.get("buyer_count", 0) or 0), len(wallets))
-    meaningful = int(eb.get("meaningful_buyers", 0) or 0)
+    meaningful = int(eb.get("qualified_buyers", eb.get("meaningful_buyers", 0)) or 0)
     buyer_pass = verified_count >= 2
     quality_pass = meaningful >= 2
     return {
@@ -2348,7 +2356,7 @@ def format_per_coin_buyer_diag(stats):
             f"• {row.get('name','?')} ({row.get('symbol','?')}): "
             f"Sig {row.get('signatures',0)} | TX {row.get('transactions',0)}/{row.get('tx_attempted',0)} | "
             f"Wallets {row.get('wallet_candidates',0)} | Swap-Buyer {row.get('swap_verified',0)} "
-            f"| Meaningful {row.get('meaningful_buyers',0)} | Stark {row.get('strong_buyers',0)} | Dust {row.get('dust_buyers',0)} "
+            f"| Qualifiziert {row.get('qualified_buyers',0)}/2 | Stark {row.get('strong_buyers',0)} | Normal {row.get('normal_buyers',0)} | Dust {row.get('dust_buyers',0)} "
             f"| {market} | {buyer_gate} | {quality_gate} | {gate}"
         )
     return "\n".join(lines)
@@ -2381,7 +2389,7 @@ def format_diagnostics(stats):
         f"↳ Signatur-Fehler: {stats.get('buyer_diag', {}).get('sig_errors', 0)} | TX-Fehler: {stats.get('buyer_diag', {}).get('tx_errors', 0)}\n"
         f"Wallet-Kandidaten: {stats.get('buyer_diag', {}).get('wallet_candidates', 0)} | Token-Zuflüsse: {stats.get('buyer_diag', {}).get('token_inflows', 0)}\n"
         f"Verifizierte Swap-Buyer: {stats.get('buyer_diag', {}).get('swap_verified', 0)} | Ohne Zahlungsleg verworfen: {stats.get('buyer_diag', {}).get('rejected_no_payment', 0)}\n"
-        f"Buyer-Qualität: Stark {stats.get('buyer_diag', {}).get('strong_buyers', 0)} | Normal/Meaningful {stats.get('buyer_diag', {}).get('meaningful_buyers', 0)} | Dust {stats.get('buyer_diag', {}).get('dust_buyers', 0)}\n"
+        f"Buyer-Qualität: Qualifiziert {stats.get('buyer_diag', {}).get('qualified_buyers', 0)} | Stark {stats.get('buyer_diag', {}).get('strong_buyers', 0)} | Normal {stats.get('buyer_diag', {}).get('normal_buyers', 0)} | Dust {stats.get('buyer_diag', {}).get('dust_buyers', 0)}\n"
         f"Ohne ≥2 Buyer verworfen: {stats.get('buyer_diag', {}).get('rejected_no_buyers', 0)} | Qualitäts-Gate verworfen: {stats.get('buyer_diag', {}).get('rejected_quality', 0)}"
         + format_per_coin_buyer_diag(stats)
         + f"\n⏱ Watchdog: Stage={stats.get('watchdog', {}).get('stage', '-')} | Kandidaten-Timeouts={stats.get('watchdog', {}).get('candidate_timeouts', 0)} | Fehler={stats.get('watchdog', {}).get('candidate_errors', 0)}"

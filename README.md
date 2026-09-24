@@ -51,3 +51,7 @@ Discovery pipeline fix: cache is loaded before network calls, providers are isol
 
 ## v3.5.9 Strong Buyer Gate
 Alerts require at least 2 verified swap buyers and at least 2 non-Dust (meaningful) buyers. Dust activity remains visible in diagnostics but cannot satisfy the quality gate. Precheck-only pairs remain non-alerting.
+
+
+## v3.6.0 Buyer Quality Accounting Fix
+Strong, Normal and Dust are now mutually exclusive buyer buckets. Qualified buyers are exactly Strong + Normal, and diagnostics show Qualified X/2 explicitly. Alert eligibility still requires at least two verified swap buyers and at least two qualified buyers.
