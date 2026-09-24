@@ -26,7 +26,7 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-APP_VERSION = "3.7.0-pro-reliable-discovery"
+APP_VERSION = "3.7.1-pro-marktfilter-diagnose"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_CHAT_ID = os.getenv("ALLOWED_CHAT_ID", "")
@@ -120,9 +120,6 @@ SOLANA_DIRECT_SIGS_PER_PROGRAM = int(os.getenv("SOLANA_DIRECT_SIGS_PER_PROGRAM",
 SOLANA_DIRECT_TX_LIMIT = int(os.getenv("SOLANA_DIRECT_TX_LIMIT", "10"))
 SOLANA_DIRECT_TTL_SECONDS = int(os.getenv("SOLANA_DIRECT_TTL_SECONDS", "900"))
 solana_direct_signatures = {}
-solana_direct_attempted = {}
-SOLANA_DIRECT_RETRY_SECONDS = int(os.getenv("SOLANA_DIRECT_RETRY_SECONDS", "60"))
-MIN_TRIGGER_INTERVAL_SECONDS = int(os.getenv("MIN_TRIGGER_INTERVAL_SECONDS", "15"))
 SOLANA_RPC_FALLBACKS = [x.strip() for x in os.getenv(
     "SOLANA_RPC_FALLBACKS", "https://solana-rpc.publicnode.com"
 ).split(",") if x.strip()]
@@ -292,7 +289,7 @@ def now():
 def allowed(update: Update):
 
     if not ALLOWED_CHAT_ID:
-        return False
+        return True
 
     return str(update.effective_chat.id) == str(
         ALLOWED_CHAT_ID
@@ -727,20 +724,12 @@ async def get_direct_solana_pairs(session):
         else:
             health.append(f"{program[:5]}:rpc-error")
 
-    # Work through fresh signatures first. A bounded retry allows indexers to
-    # catch up without analyzing the same busy-program transactions every scan.
-    dedup={}
+    # Deduplicate while preserving newest-first input order.
+    dedup=[]; seen=set()
     for sig,ts in sigs:
-        dedup[sig] = max(ts, dedup.get(sig, 0))
-    for sig, attempted_at in list(solana_direct_attempted.items()):
-        if now - attempted_at > SOLANA_DIRECT_TTL_SECONDS:
-            solana_direct_attempted.pop(sig, None)
-    eligible = [(sig, ts) for sig, ts in dedup.items()
-                if now - solana_direct_attempted.get(sig, 0) >= SOLANA_DIRECT_RETRY_SECONDS]
-    eligible.sort(key=lambda row: (row[0] in solana_direct_attempted, -row[1]))
-    sigs = eligible[:SOLANA_DIRECT_TX_LIMIT]
-    for sig, _ in sigs:
-        solana_direct_attempted[sig] = now
+        if sig not in seen:
+            seen.add(sig); dedup.append((sig,ts))
+    sigs=dedup[:SOLANA_DIRECT_TX_LIMIT]
 
     async def fetch_tx(sig):
         tx, source, errors = await solana_rpc_with_fallback(
@@ -782,7 +771,7 @@ async def get_direct_solana_pairs(session):
         if isinstance(pair,dict) and pair.get("pairAddress"):
             uniq.setdefault(pair.get("pairAddress"),pair)
     pairs=list(uniq.values())
-    return pairs, {"signatures":len(sigs),"pending":max(0,len(eligible)-len(sigs)),"mints":len(mints),"pairs":len(pairs),
+    return pairs, {"signatures":len(sigs),"mints":len(mints),"pairs":len(pairs),
                    "enrich429":enrich429,"raydium":";".join(ray_health[:8]),"rpc":";".join(health)}
 
 async def discover_candidates():
@@ -796,7 +785,6 @@ async def discover_candidates():
         "vol_low": 0, "vol_high": 0, "txns_low": 0,
         "price_change_high": 0, "meme_filter": 0, "passed": 0,
         "pair_errors": 0, "buyer_precheck": 0, "ultra_early_precheck": 0,
-        "cache_only": 0,
         "source_health": {"pipeline": "started"},
     }
     source_health = stats["source_health"]
@@ -837,11 +825,9 @@ async def discover_candidates():
         source_health["gecko_solana"] = sol_err or sol_health
         source_health["gecko_ethereum"] = eth_err or eth_health
         source_health["dex_watchdog"] = dex_err or "ok"
-        source_health["solana_direct"] = direct_err or f"sigs:{direct_health.get('signatures',0)} pending:{direct_health.get('pending',0)} mints:{direct_health.get('mints',0)} pairs:{direct_health.get('pairs',0)} ray:{direct_health.get('raydium','n/a')} enrich429:{direct_health.get('enrich429',0)}"
+        source_health["solana_direct"] = direct_err or f"sigs:{direct_health.get('signatures',0)} mints:{direct_health.get('mints',0)} pairs:{direct_health.get('pairs',0)} ray:{direct_health.get('raydium','n/a')} enrich429:{direct_health.get('enrich429',0)}"
         stats["profiles"] = len(profiles or [])
         live_pairs = (direct_sol or []) + (sol_gt or []) + (eth_gt or [])
-        live_keys = {((p.get("chainId") or "").lower(), p.get("pairAddress"))
-                     for p in live_pairs if isinstance(p, dict)}
 
         if live_pairs:
             try:
@@ -850,6 +836,7 @@ async def discover_candidates():
             except Exception as exc:
                 source_health["cache_write"] = f"error:{type(exc).__name__}"
 
+        live_pair_keys = {((p.get("chainId") or "").lower(), p.get("pairAddress") or "") for p in live_pairs if isinstance(p, dict) and p.get("pairAddress")}
         merged_pairs = {}
         for pair in live_pairs + cached_pairs:
             if isinstance(pair, dict):
@@ -867,10 +854,7 @@ async def discover_candidates():
             if err:
                 if err == "missing": stats["missing_data"] += 1
                 else: stats["pair_errors"] += 1
-            if pairs:
-                results.append(pairs)
-                live_keys.update(((p.get("chainId") or "").lower(), p.get("pairAddress"))
-                                 for p in pairs if isinstance(p, dict))
+            if pairs: results.append(pairs)
         stats["pair_responses"] = len(results)
         source_health["pipeline"] = "providers_done"
         for pairs in results:
@@ -890,17 +874,28 @@ async def discover_candidates():
                     price_change=clean_number((pair.get("priceChange") or {}).get("h24")); age_hours=pair_age_hours(pair)
                     if age_hours is None: stats["age_missing"] += 1; continue
                     # Strict market gate remains unchanged for real TOP-EARLY alerts.
-                    strict_pass = (chain, pair_address) in live_keys
-                    if not strict_pass: stats["cache_only"] += 1
-                    if age_hours*60 < MIN_PAIR_AGE_MINUTES: stats["too_new"] += 1; strict_pass = False
-                    elif age_hours > MAX_PAIR_AGE_HOURS: stats["too_old"] += 1; strict_pass = False
-                    elif liquidity < MIN_LIQUIDITY_USD: stats["liq_low"] += 1; strict_pass = False
-                    elif liquidity > MAX_LIQUIDITY_USD: stats["liq_high"] += 1; strict_pass = False
-                    elif volume < MIN_VOLUME_24H: stats["vol_low"] += 1; strict_pass = False
-                    elif volume > MAX_VOLUME_24H: stats["vol_high"] += 1; strict_pass = False
-                    elif total < MIN_TXNS_24H: stats["txns_low"] += 1; strict_pass = False
-                    elif price_change > MAX_PRICE_CHANGE_24H: stats["price_change_high"] += 1; strict_pass = False
-                    elif not meme_signal(name,symbol): stats["meme_filter"] += 1; strict_pass = False
+                    # v3.7.1 records the first concrete exclusion + observed value.
+                    strict_pass = True
+                    market_filter_reason = "BESTANDEN"
+                    market_filter_value = "-"
+                    if age_hours*60 < MIN_PAIR_AGE_MINUTES:
+                        stats["too_new"] += 1; strict_pass = False; market_filter_reason = "zu_neu"; market_filter_value = f"{age_hours*60:.1f}m < {MIN_PAIR_AGE_MINUTES}m"
+                    elif age_hours > MAX_PAIR_AGE_HOURS:
+                        stats["too_old"] += 1; strict_pass = False; market_filter_reason = "zu_alt"; market_filter_value = f"{age_hours:.1f}h > {MAX_PAIR_AGE_HOURS}h"
+                    elif liquidity < MIN_LIQUIDITY_USD:
+                        stats["liq_low"] += 1; strict_pass = False; market_filter_reason = "liquiditaet_niedrig"; market_filter_value = f"${liquidity:,.0f} < ${MIN_LIQUIDITY_USD:,.0f}"
+                    elif liquidity > MAX_LIQUIDITY_USD:
+                        stats["liq_high"] += 1; strict_pass = False; market_filter_reason = "liquiditaet_hoch"; market_filter_value = f"${liquidity:,.0f} > ${MAX_LIQUIDITY_USD:,.0f}"
+                    elif volume < MIN_VOLUME_24H:
+                        stats["vol_low"] += 1; strict_pass = False; market_filter_reason = "volumen_niedrig"; market_filter_value = f"${volume:,.0f} < ${MIN_VOLUME_24H:,.0f}"
+                    elif volume > MAX_VOLUME_24H:
+                        stats["vol_high"] += 1; strict_pass = False; market_filter_reason = "volumen_hoch"; market_filter_value = f"${volume:,.0f} > ${MAX_VOLUME_24H:,.0f}"
+                    elif total < MIN_TXNS_24H:
+                        stats["txns_low"] += 1; strict_pass = False; market_filter_reason = "txns_niedrig"; market_filter_value = f"{total} < {MIN_TXNS_24H}"
+                    elif price_change > MAX_PRICE_CHANGE_24H:
+                        stats["price_change_high"] += 1; strict_pass = False; market_filter_reason = "preisanstieg_hoch"; market_filter_value = f"{price_change:.1f}% > {MAX_PRICE_CHANGE_24H}%"
+                    elif not meme_signal(name,symbol):
+                        stats["meme_filter"] += 1; strict_pass = False; market_filter_reason = "meme_filter"; market_filter_value = "kein Meme-Signal"
 
                     # Buyer precheck: inspect a small set of young Solana pairs even when the
                     # strict market gate rejects them. They can NEVER become an alert unless
@@ -918,7 +913,7 @@ async def discover_candidates():
                     precheck_pass = regular_precheck or ultra_precheck
                     if not strict_pass and not precheck_pass:
                         continue
-                    candidates.append({"chain":chain,"address":token_address,"quote_address":(pair.get("quoteToken") or {}).get("address"),"pair_address":pair_address,"name":name,"symbol":symbol,"liquidity":liquidity,"volume":volume,"buys":buys,"sells":sells,"txns":total,"price_change":price_change,"age_hours":age_hours,"price_usd":clean_number(pair.get("priceUsd")),"url":pair.get("url"),"strict_market_pass":strict_pass,"buyer_precheck_only":not strict_pass,"ultra_early_precheck":bool(ultra_precheck and not strict_pass)})
+                    candidates.append({"chain":chain,"address":token_address,"pair_address":pair_address,"name":name,"symbol":symbol,"liquidity":liquidity,"volume":volume,"buys":buys,"sells":sells,"txns":total,"price_change":price_change,"age_hours":age_hours,"price_usd":clean_number(pair.get("priceUsd")),"url":pair.get("url"),"strict_market_pass":strict_pass,"buyer_precheck_only":not strict_pass,"ultra_early_precheck":bool(ultra_precheck and not strict_pass),"market_filter_reason":market_filter_reason,"market_filter_value":market_filter_value,"market_data_live":((chain,pair_address) in live_pair_keys)})
                     if strict_pass:
                         stats["passed"] += 1
                     else:
@@ -1217,125 +1212,208 @@ async def eth_get_code(
 # ETHEREUM EARLY BUYERS
 # ============================================================
 
-ETH_QUOTE_DECIMALS = {
-    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": (18, "weth"),
-    "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": (6, "stable"),
-    "0xdac17f958d2ee523a2206206994597c13d831ec7": (6, "stable"),
-    "0x6b175474e89094c44da98b954eedeac495271d0f": (18, "stable"),
-}
+async def ethereum_early_buyers(
+    session,
+    candidate
+):
 
+    result = {
+        "buyers": [],
+        "buyer_count": 0,
+        "earliest_minutes": None,
+        "status":
+            "⚪ Keine Daten"
+    }
 
-async def ethereum_early_buyers(session, candidate):
-    """Verify a conservative direct EOA buy via transaction receipt payment leg.
-
-    Transfer logs alone are never sufficient to call a wallet a buyer. Only
-    WETH/USDC/USDT/DAI quote pools and direct buyer recipients are supported.
-    Router custody and unsupported quote assets stay diagnostic-only.
-    """
-    result = {"buyers": [], "buyer_count": 0, "qualified_buyers": 0,
-              "signatures_found": 0, "transactions_parsed": 0,
-              "analysis_complete": True, "status": "⚪ Keine verifizierten Käufe"}
-    pair = str(candidate.get("pair_address") or "").lower()
-    token = str(candidate.get("address") or "").lower()
-    quote = str(candidate.get("quote_address") or "").lower()
-    if quote not in ETH_QUOTE_DECIMALS or not pair.startswith("0x") or not token.startswith("0x"):
-        result["status"] = "⚪ Quote-Asset nicht unterstützt"
-        return result
-    current_block = await eth_get_block_number(session)
-    if current_block is None:
-        result.update(analysis_complete=False, status="🟠 Ethereum-RPC nicht verfügbar")
-        return result
-    blocks_back = max(100, min(30000, int((candidate.get("age_hours", 0) + 2) * 300)))
-    # Do not call recent buyers 'early' if the pool predates the bounded window.
-    if blocks_back > 4000:
-        result["status"] = "⚪ Ethereum-Pool zu alt für verifizierte Frühkäufe"
-        return result
-    from_block = max(0, current_block - blocks_back)
-    logs = []
-    for start in range(from_block, current_block + 1, ETH_LOG_CHUNK_SIZE):
-        batch = await eth_get_logs(session, token, start,
-                                   min(current_block, start + ETH_LOG_CHUNK_SIZE - 1),
-                                   [ERC20_TRANSFER_TOPIC, topic_address(pair)])
-        if batch is None:
-            result.update(analysis_complete=False, status="🟠 Transfer-RPC unvollständig")
-            return result
-        logs.extend(batch)
-    # Inspect the earliest pool outflows, within a bounded receipt budget.
-    logs = sorted(logs, key=lambda row: hex_to_int(row.get("blockNumber")))
-    unique = {}
-    for log in logs:
-        tx_hash = log.get("transactionHash")
-        if tx_hash and tx_hash not in unique:
-            unique[tx_hash] = log
-        if len(unique) >= 12:
-            break
-    result["signatures_found"] = len(unique)
-    decimals, quote_kind = ETH_QUOTE_DECIMALS[quote]
-
-    async def inspect(tx_hash, log):
-        receipt, tx = await asyncio.gather(
-            rpc_call(session, ETH_RPC_URL, "eth_getTransactionReceipt", [tx_hash]),
-            rpc_call(session, ETH_RPC_URL, "eth_getTransactionByHash", [tx_hash]),
+    current_block = (
+        await eth_get_block_number(
+            session
         )
-        if not isinstance(receipt, dict) or not isinstance(tx, dict):
-            return None, False
-        if receipt.get("status") != "0x1":
-            return None, True
-        wallet = decode_topic_address((log.get("topics") or [None, None, None])[2]) if len(log.get("topics") or []) >= 3 else None
-        if not wallet or wallet.lower() != str(tx.get("from") or "").lower():
-            return None, True
-        wallet = wallet.lower()
-        if wallet in {pair, token, quote}:
-            return None, True
-        code = await eth_get_code(session, wallet)
-        if code is None:
-            return None, False
-        if code not in {"0x", "0x0"}:
-            return None, True
-        paid = 0
-        token_out = False
-        for entry in receipt.get("logs") or []:
-            topics = entry.get("topics") or []
-            if len(topics) < 3 or str(topics[0]).lower() != ERC20_TRANSFER_TOPIC:
-                continue
-            address = str(entry.get("address") or "").lower()
-            from_addr, to_addr = decode_topic_address(topics[1]), decode_topic_address(topics[2])
-            if address == token and from_addr == pair and to_addr == wallet:
-                token_out = True
-            if address == quote and to_addr == pair:
-                paid += hex_to_int(entry.get("data"))
-        if not token_out or paid <= 0:
-            return None, True
-        quote_paid = paid / (10 ** decimals)
-        minimum = 0.001 if quote_kind == "weth" else 2.0
-        strength = "normal" if quote_paid >= minimum else "dust"
-        if quote_paid >= (0.1 if quote_kind == "weth" else 20.0):
-            strength = "strong"
-        return {"wallet": wallet, "block": hex_to_int(log.get("blockNumber")),
-                "buyer_strength": strength, "quote_paid": quote_paid,
-                "quote_symbol": quote_kind.upper(), "verified_swap": True}, True
+    )
 
-    try:
-        inspected = await asyncio.wait_for(
-            asyncio.gather(*(inspect(h, log) for h, log in unique.items())), timeout=16)
-    except asyncio.TimeoutError:
-        result.update(analysis_complete=False, status="🟠 Receipt-RPC unvollständig")
+    if current_block is None:
+        result["status"] = (
+            "⚪ RPC nicht verfügbar"
+        )
         return result
-    by_wallet = {}
-    for buyer, parsed in inspected:
-        result["transactions_parsed"] += int(parsed)
-        if buyer:
-            wallet = buyer["wallet"]
-            if wallet not in by_wallet or buyer["block"] < by_wallet[wallet]["block"]:
-                by_wallet[wallet] = buyer
-    if result["transactions_parsed"] < len(unique):
-        result["analysis_complete"] = False
-    buyers = sorted(by_wallet.values(), key=lambda row: row["block"])
-    result["buyers"] = buyers[:10]
-    result["buyer_count"] = len(buyers)
-    result["qualified_buyers"] = sum(row["buyer_strength"] != "dust" for row in buyers)
-    result["status"] = "🟢 Verifizierte direkte Käufer erkannt" if buyers else (
-        "🟠 Receipt-RPC unvollständig" if not result["analysis_complete"] else "⚪ Keine verifizierten direkten Käufe")
+
+    age_hours = candidate[
+        "age_hours"
+    ]
+
+    # Sicherheitsmarge.
+    blocks_back = int(
+        (age_hours + 2)
+        * 3600
+        / 12
+    )
+
+    blocks_back = max(
+        blocks_back,
+        100
+    )
+
+    blocks_back = min(
+        blocks_back,
+        30_000
+    )
+
+    from_block = max(
+        0,
+        current_block - blocks_back
+    )
+
+    pair = candidate[
+        "pair_address"
+    ]
+
+    token = candidate[
+        "address"
+    ]
+
+    buyer_logs = []
+
+    # Transfer-Events:
+    # token -> pair = Verkauf
+    # pair -> wallet = möglicher Kauf
+
+    for start in range(
+        from_block,
+        current_block + 1,
+        ETH_LOG_CHUNK_SIZE
+    ):
+
+        end = min(
+            start
+            + ETH_LOG_CHUNK_SIZE
+            - 1,
+            current_block
+        )
+
+        logs = await eth_get_logs(
+            session,
+            token,
+            start,
+            end,
+            [
+                ERC20_TRANSFER_TOPIC,
+                topic_address(pair),
+            ]
+        )
+
+        if not logs:
+            continue
+
+        buyer_logs.extend(
+            logs
+        )
+
+        # RPC schonen.
+        await asyncio.sleep(
+            0.05
+        )
+
+    if not buyer_logs:
+        result["status"] = (
+            "⚪ Keine frühen Transfers"
+        )
+        return result
+
+    wallets = {}
+
+    # Nur Transfer "from pair -> wallet"
+    for log in buyer_logs:
+
+        topics = (
+            log.get(
+                "topics"
+            )
+            or []
+        )
+
+        if len(topics) < 3:
+            continue
+
+        to_address = (
+            decode_topic_address(
+                topics[2]
+            )
+        )
+
+        if not to_address:
+            continue
+
+        if to_address.lower() == (
+            pair.lower()
+        ):
+            continue
+
+        # Contract-Adressen nicht als
+        # normale Wallets werten.
+        code = await eth_get_code(
+            session,
+            to_address
+        )
+
+        if code and code != "0x":
+            continue
+
+        block_number = hex_to_int(
+            log.get(
+                "blockNumber"
+            )
+        )
+
+        timestamp = None
+
+        # Der Block wird später zeitlich
+        # über die Pair-Alter-Näherung
+        # eingeordnet.
+        wallets.setdefault(
+            to_address,
+            {
+                "wallet":
+                    to_address,
+                "block":
+                    block_number,
+                "count":
+                    1
+            }
+        )
+
+        if block_number < wallets[
+            to_address
+        ]["block"]:
+            wallets[
+                to_address
+            ]["block"
+            ] = block_number
+
+        else:
+            wallets[
+                to_address
+            ]["count"] += 1
+
+    if not wallets:
+        result["status"] = (
+            "⚪ Keine Wallet-Käufer erkannt"
+        )
+        return result
+
+    ordered = sorted(
+        wallets.values(),
+        key=lambda x: x["block"]
+    )
+
+    # v3.7 reliable verification: ERC-20 transfer direction alone is not proof of a buy.
+    # Until a traceable ETH/stablecoin payment leg is present, keep these wallets diagnostic-only.
+    result["transfer_wallets"] = ordered[:10]
+    result["buyers"] = []
+    result["buyer_count"] = 0
+    result["swap_verified"] = 0
+    result["qualified_buyers"] = 0
+    result["analysis_complete"] = True
+    result["status"] = "⚪ Transfers erkannt, aber kein verifizierter Zahlungsfluss"
     return result
 
 
@@ -1920,7 +1998,6 @@ async def perform_scan(progress=None):
     await report(f"Discovery fertig: {len(raw)} Markt-Kandidaten")
 
     if not raw:
-        last_scan_cache = []
         return {"checked": 0, "analyzed": 0, "candidates": [], "diagnostics": diagnostics}
 
     analyzed = []
@@ -1959,6 +2036,10 @@ async def perform_scan(progress=None):
             "name": result.get("name") or result.get("symbol") or "?",
             "symbol": result.get("symbol") or "?",
             "strict_market_pass": bool(result.get("strict_market_pass")),
+            "market_filter_reason": result.get("market_filter_reason", "unbekannt"),
+            "market_filter_value": result.get("market_filter_value", "-"),
+            "market_data_live": bool(result.get("market_data_live", False)),
+            "score": int(result.get("score", 0) or 0),
             "signatures": int(eb.get("signatures_found", 0) or 0),
             "tx_attempted": int(eb.get("tx_attempted", 0) or 0),
             "transactions": int(eb.get("transactions_parsed", 0) or 0),
@@ -1975,7 +2056,7 @@ async def perform_scan(progress=None):
             "analysis_note": eb.get("analysis_note", "vollständig"),
             "buyer_gate": "PASS" if bc >= 2 else "REJECT",
             "quality_gate": "PASS" if int(eb.get("qualified_buyers", eb.get("meaningful_buyers", 0)) or 0) >= 2 else "REJECT",
-            "gate": "PASS" if buyer_gate_status(result)["pass"] else "REJECT",
+            "gate": "PASS" if (bc >= 2 and int(eb.get("qualified_buyers", eb.get("meaningful_buyers", 0)) or 0) >= 2) else "REJECT",
         })
         buyer_diag["rpc_errors"] += len(errs)
         buyer_diag["rpc_429"] += sum("HTTP 429" in e for e in errs)
@@ -1989,7 +2070,6 @@ async def perform_scan(progress=None):
         buyer_diag["tx_error_stage_timeout"] += int(eb.get("tx_error_stage_timeout", 0) or 0)
         if not eb.get("analysis_complete", True):
             buyer_diag["incomplete_rpc"] += 1
-            continue
         if bc < 2:
             buyer_diag["rejected_no_buyers"] += 1
             continue
@@ -1997,7 +2077,7 @@ async def perform_scan(progress=None):
             buyer_diag["rejected_quality"] += 1
             continue
         # A precheck-only pair is diagnostic only and can never enter TOP-EARLY.
-        if result.get("strict_market_pass") and result["score"] >= ALERT_SCORE:
+        if (result.get("strict_market_pass") and result.get("market_data_live") and eb.get("analysis_complete", True) and result["score"] >= ALERT_SCORE):
             analyzed.append(result)
 
     analyzed.sort(key=lambda x: (x["score"], x["early_buyers"]["buyer_count"], -x["age_hours"]), reverse=True)
@@ -2159,8 +2239,9 @@ def buyer_gate_status(candidate):
     wallets = verified_buyer_wallets(candidate)
     verified_count = min(int(eb.get("buyer_count", 0) or 0), len(wallets))
     meaningful = int(eb.get("qualified_buyers", eb.get("meaningful_buyers", 0)) or 0)
-    buyer_pass = verified_count >= 2
-    quality_pass = meaningful >= 2 and bool(eb.get("analysis_complete", True))
+    analysis_complete = bool(eb.get("analysis_complete", True))
+    buyer_pass = verified_count >= 2 and analysis_complete
+    quality_pass = meaningful >= 2 and analysis_complete
     return {
         "verified_count": verified_count,
         "meaningful_count": meaningful,
@@ -2310,6 +2391,8 @@ def format_per_coin_buyer_diag(stats):
     lines = ["\nCoin-Details:"]
     for row in rows[:8]:
         market = "Markt✓" if row.get("strict_market_pass") else "Precheck"
+        market_detail = "Marktfilter: BESTANDEN" if row.get("strict_market_pass") else f"Marktfilter: {row.get('market_filter_reason','unbekannt')} ({row.get('market_filter_value','-')})"
+        freshness = "Live✓" if row.get("market_data_live") else "Cache⚠"
         gate = "Gate✓" if row.get("gate") == "PASS" else "Gate✗"
         buyer_gate = "Buyer✓" if row.get("buyer_gate") == "PASS" else "Buyer✗"
         quality_gate = "Qualität✓" if row.get("quality_gate") == "PASS" else "Qualität✗"
@@ -2319,7 +2402,7 @@ def format_per_coin_buyer_diag(stats):
             f"Sig {row.get('signatures',0)} | TX {row.get('transactions',0)}/{row.get('tx_attempted',0)} | "
             f"Wallets {row.get('wallet_candidates',0)} | Swap-Buyer {row.get('swap_verified',0)} "
             f"| Qualifiziert: {row.get('qualified_buyers',0)} (Minimum: 2) | Stark {row.get('strong_buyers',0)} | Normal {row.get('normal_buyers',0)} | Dust {row.get('dust_buyers',0)} "
-            f"| {market} | {completeness} | {buyer_gate} | {quality_gate} | {gate}"
+            f"| Score {row.get('score',0)} | {market} | {market_detail} | {freshness} | {completeness} | {buyer_gate} | {quality_gate} | {gate}"
         )
     return "\n".join(lines)
 
@@ -2344,7 +2427,6 @@ def format_diagnostics(stats):
         f"Meme-Filter: {stats.get('meme_filter', 0)}\n"
         f"Pair/API-Fehler: {stats.get('pair_errors', 0)}\n"
         f"Filter bestanden: {stats.get('passed_unique', stats.get('passed', 0))}\n"
-        f"Nur aus altem Cache (kein Alarm): {stats.get('cache_only', 0)}\n"
         f"\n🔬 Buyer-Diagnose:\n"
         f"Signaturen geprüft: {stats.get('buyer_diag', {}).get('signatures', 0)}\n"
         f"Transaktionen versucht/geparst/übersprungen: {stats.get('buyer_diag', {}).get('tx_attempted', 0)}/{stats.get('buyer_diag', {}).get('transactions', 0)}/{stats.get('buyer_diag', {}).get('tx_skipped', 0)}\n"
@@ -2362,34 +2444,6 @@ def format_diagnostics(stats):
     )
 
 
-def split_telegram_text(content, limit=3900):
-    """Keep each Telegram message under its text limit, including long diagnostics."""
-    chunks = []
-    current = ""
-    for line in content.splitlines(keepends=True):
-        while line:
-            remaining = limit - len(current)
-            if len(line) <= remaining:
-                current += line
-                break
-            if current and remaining < 80:
-                chunks.append(current)
-                current = ""
-                continue
-            split_at = line.rfind("\n", 0, remaining + 1)
-            if split_at <= 0:
-                split_at = remaining
-            else:
-                split_at += 1
-            current += line[:split_at]
-            line = line[split_at:]
-            chunks.append(current)
-            current = ""
-    if current:
-        chunks.append(current)
-    return chunks
-
-
 async def _send_scan_result(message, result):
     checked = result["checked"]
     candidates = result["candidates"]
@@ -2403,8 +2457,7 @@ async def _send_scan_result(message, result):
             text += format_candidate(index, candidate) + "\n\n"
         text += diagnostic_text
     try:
-        for part in split_telegram_text(text):
-            await message.reply_text(part, disable_web_page_preview=True, read_timeout=45, write_timeout=45, connect_timeout=20, pool_timeout=20)
+        await message.reply_text(text, disable_web_page_preview=True, read_timeout=45, write_timeout=45, connect_timeout=20, pool_timeout=20)
     except Exception as exc:
         print("[SCAN RESULT SEND ERROR]", type(exc).__name__, str(exc))
 
@@ -2518,8 +2571,10 @@ async def buy(
 
     await update.message.reply_text(
         "🧪 PAPER BUY\n\n"
-        "Öffne einen Early-Alert und tippe auf „Paper Buy“. "
-        "Die Position wird unter /paper gespeichert. Es wird kein echtes Geld verwendet."
+        "Paper Trading ist aktiv.\n"
+        "Kein echtes Geld wird verwendet.\n\n"
+        "Die echte Wallet-Erkennung "
+        "läuft in Version 3.3."
     )
 
 
@@ -2599,15 +2654,10 @@ async def scanner_loop(
 ):
 
     await asyncio.sleep(20)
-    last_scan_started = 0.0
 
     while True:
 
         try:
-            delay = MIN_TRIGGER_INTERVAL_SECONDS - (time.monotonic() - last_scan_started)
-            if delay > 0:
-                await asyncio.sleep(delay)
-            last_scan_started = time.monotonic()
 
             async with scan_lock:
                 result = await asyncio.wait_for(perform_scan(), timeout=240)
@@ -2673,9 +2723,6 @@ def main():
         raise RuntimeError(
             "TELEGRAM_BOT_TOKEN fehlt."
         )
-
-    if not ALLOWED_CHAT_ID or not ALLOWED_CHAT_ID.lstrip("-").isdigit():
-        raise RuntimeError("ALLOWED_CHAT_ID fehlt oder ist ungültig.")
 
     application = (
         ApplicationBuilder()

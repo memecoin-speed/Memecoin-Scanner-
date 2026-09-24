@@ -1,28 +1,67 @@
-# Memecoin Scanner v3.7.0
+# Memecoin Scanner v3.4.9 Pro Direct Solana Pools
 
-Telegram bot for early Solana and Ethereum pool discovery, on-chain buyer checks, alerts and paper-entry logging. It **never executes real trades** and does not need a wallet or private key.
+Direct Solana discovery now resolves discovered mints through Raydium API v3 `/pools/info/mint` before falling back to DexScreener. This is intended to turn on-chain `mints` into usable `pairs` even when DexScreener/Gecko are rate limited.
 
-## Set up
+Safety: paper trading only; no private keys or automatic real-money execution.
 
-1. Create a Telegram bot with BotFather and copy the token.
-2. Set `TELEGRAM_BOT_TOKEN` and your numeric `ALLOWED_CHAT_ID` as host environment variables. The bot refuses to start without either setting. Do not commit a real token or a populated `.env` file.
-3. Deploy this repository as a web service with `Dockerfile` on Render, or run `pip install -r requirements.txt && python app.py`. The service listens on `$PORT` at `/health`. Use exactly one running instance per bot token (Telegram long polling).
-4. In Telegram, send `/start`, `/status` and `/scan`. Alerts and `/paper` are available in the allowed chat. An alert's “Paper Buy” button saves an entry price and amount; it is **not** a live P&L tracker.
+# Memecoin Scanner v3.4.4 Pro Fast Discovery
 
-The default public RPC endpoints can rate limit heavily. For sustained operation, provide your own `SOLANA_RPC`, comma-separated `SOLANA_RPC_FALLBACKS`, and optionally `ETH_RPC_URL` and `SOLANA_WS`. A persistent volume for `DB_FILE` is needed if alerts, cached pools and paper entries must survive redeployment. A sleeping or suspended host cannot provide continuous alerts.
+- Fast/fault-isolated discovery: DexScreener, GeckoTerminal and Solana Direct run independently.
+- Short per-source watchdogs: a slow provider is skipped instead of blocking the scan.
+- Faster RPC and candidate budgets while Telegram /start and /status remain responsive.
+- Strict TOP-EARLY gate remains: at least 2 distinct verified buyer wallets are required.
+- Paper trading only; no private keys or automatic real-money execution.
 
-## How a candidate qualifies
+Version: `3.4.4-pro-fast-discovery`
 
-- Fresh market data must pass liquidity, volume, activity, age and score filters. A pair present only in the persistent cache can enter Solana diagnostics but cannot trigger an alert.
-- Solana: the parsed transaction must show target-token inflow to a signing wallet and SOL or stablecoin spend in that transaction. Two distinct, non-dust buyers are required.
-- Ethereum: currently supports direct buyer recipients in WETH, USDC, USDT and DAI pools. Receipt logs must show the pool sending the token to the transaction sender and quote-token payment into the pool. Only the earliest bounded transaction sample of pools around 11 hours old or younger is inspected. Router custody, other quote assets, incomplete RPC responses and older pools do not pass the buyer gate.
-- These are conservative heuristics, **not** proof of profitability or protection from rugs. Review the token, liquidity and contract separately before acting.
 
-## Changes since v3.6.3
+## v3.4.6
+Discovery pipeline fix: cache is loaded before network calls, providers are isolated, profile enrichment runs concurrently, and diagnostics always show pipeline/provider state.
 
-- Solana direct discovery rotates through fresh signatures instead of repeating the first batch; WS triggers are rate limited.
-- Ethereum now checks payment receipts instead of labeling transfer recipients as verified buyers.
-- Incomplete analysis and cached-only market data cannot produce alerts.
-- Long Telegram diagnostics are sent in safe-sized chunks. Configuration and old `/buy` text were corrected.
+## v3.4.7 Pro Solana Fast Path
+- Solana direct discovery now uses a bounded incremental fast path.
+- Only a small recent signature/transaction batch is processed per scan.
+- RPC calls are parallelized within the existing semaphore limits.
+- Solana mint enrichment is bounded per token so one slow provider cannot stall discovery.
+- Successful pairs continue to be persisted in SQLite for later scans.
 
-Run offline checks with `python -m unittest discover -s tests -v`.
+## v3.4.8 Buyer Precheck
+- Up to 3 young Solana pairs can enter a relaxed diagnostic buyer precheck.
+- The normal market filters remain unchanged for real alerts.
+- Precheck-only pairs can never appear as TOP-EARLY or trigger an alert.
+- Goal: exercise Solana signature/transaction parsing even when the strict market filter has zero candidates.
+
+## v3.5.4
+- Per-coin buyer diagnostics: signatures, parsed/attempted TXs, wallet candidates, verified swap buyers, market/precheck status, and buyer-gate result.
+- Keeps the verified-buyer gate and discovery behavior from v3.5.2 unchanged.
+
+
+## v3.5.4 Ultra-Early Precheck
+- Solana pools younger than MIN_PAIR_AGE_MINUTES may enter the diagnostic buyer precheck even before liquidity/volume mature.
+- Ultra-early precheck remains diagnostic-only and can never generate EARLY ALERT/TOP-EARLY unless the strict market gate passes.
+- Maximum diagnostic precheck remains capped at 3, prioritizing the youngest ultra-early pools.
+
+
+## v3.5.5 Ultra-Early Selection Fix
+- Fixes ultra-new Solana selection when provider/cache 24h transaction counters are still zero or missing.
+- Any otherwise valid Solana pair younger than `MIN_PAIR_AGE_MINUTES` can enter the capped diagnostic precheck.
+- Ultra-early candidates remain diagnostic-only; strict market pass + verified buyer gate are still required for alerts.
+- Precheck remains capped at 3 and prioritizes ultra-early pairs first.
+
+
+## v3.5.9 Strong Buyer Gate
+Alerts require at least 2 verified swap buyers and at least 2 non-Dust (meaningful) buyers. Dust activity remains visible in diagnostics but cannot satisfy the quality gate. Precheck-only pairs remain non-alerting.
+
+
+## v3.6.0 Buyer Quality Accounting Fix
+Strong, Normal and Dust are now mutually exclusive buyer buckets. Qualified buyers are exactly Strong + Normal, and diagnostics show Qualified X/2 explicitly. Alert eligibility still requires at least two verified swap buyers and at least two qualified buyers.
+
+
+## v3.6.3
+- Multi-RPC fallback: one attempt per endpoint, then rotate on HTTP/RPC/timeout errors.
+- Buyer diagnostics distinguish a true zero-buyer result from an RPC-incomplete analysis.
+
+## v3.6.2
+- Bounded one-time retry for transient Solana getTransaction RPC/HTTP errors and local stage timeouts.
+- Buyer quality diagnostics now display qualified buyer count with the minimum explicitly.
+- Market filters, buyer-quality thresholds, and alert gates are unchanged.
